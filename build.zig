@@ -12,18 +12,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const flags = &[_][]const u8{
-        "-DMA_NO_FLAC",
         "-DMA_NO_WEBAUDIO",
         "-DMA_NO_ENCODING",
         "-DMA_NO_NULL",
-        "--std=c99"
+        "-DMA_NO_JACK",
+        "-DMA_NO_DSOUND",
+        "-DMA_NO_WINMM",
+        "-std=c99",
+        "-fno-sanitize=undefined",
     };
     exe.addCSourceFile(.{.file = .{.cwd_relative = "deps/miniaudio_impl.c"}, .flags = flags});
     exe.addIncludePath(.{.cwd_relative = "deps/"});
     exe.linkLibC();
+    // miniaudio deps
+    exe.linkSystemLibrary("sqlite3");
     exe.linkSystemLibrary("m");
     exe.linkSystemLibrary("pthread");
     exe.linkSystemLibrary("dl");
+
+    exe.linkSystemLibrary("readline");
     exe.linkSystemLibraryPkgConfigOnly("taglib_c");
 
     b.installArtifact(exe);

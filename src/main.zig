@@ -1,18 +1,178 @@
 const std = @import("std");
 const c = @import("c.zig");
+const db = @import("db.zig");
+const DB = db.DB;
 const Metadata = @import("Metadata.zig");
 const audio = @import("audio.zig");
+const playlist = @import("playlist.zig");
+const App = @import("app.zig").App;
+const consts = @import("constants.zig");
+const rl = @import("readline.zig");
 
-pub fn main() !void {
-    const allocator = std.heap.c_allocator;
-    _ = allocator;
-   //var metadata = try Metadata.init(allocator, "welp.mp3");
-   //try metadata.prompt_missing(allocator);
-   //const config = try Metadata.MetadataConfig.fromMetadata(metadata, "welp.mp3");
-   //std.debug.print("{s}\n", .{try config.toJson(allocator)});
-    var engine: c.ma_engine = undefined;
-    _ = c.ma_engine_init(null, &engine);
-    _ = c.ma_engine_play_sound(&engine, "welp.mp3", null);
-    while (true) { std.time.sleep(std.time.ns_per_s); }
+const Allocator = std.mem.Allocator;
+
+const SONG = "music/welp.mp3";
+
+
+pub fn indexDir(database: DB, allocator: Allocator, dir: []const u8) !void {
+    var iterableDir = try std.fs.cwd().openIterableDir(dir, .{});
+    defer iterableDir.close();
+    var iter = iterableDir.iterate();
+    while (try iter.next()) |entry| {
+        const path = try std.fs.path.joinZ(allocator, &[_][]const u8 {dir, entry.name});
+        defer allocator.free(path);
+        if (entry.kind == .directory) {
+            try indexDir(database, allocator, path);
+            continue;
+        }
+        if (entry.kind != .file) {
+            std.log.info("path `{s}` points to a file of kind {}, skipping...", .{path, entry.kind});
+            continue;
+        }
+        if (try database.pathAdded(allocator, path)) {
+            std.log.info("path `{s}` already added, skipping...", .{path});
+            continue;
+        }
+        var metadata = try Metadata.init(allocator, path);
+        defer metadata.deinit();
+        if (
+            metadata.artist == null or
+            metadata.title  == null or
+            metadata.year   == null or
+            metadata.album  == null
+        ) {
+            try metadata.prompt_missing();
+        }
+        try db.addSong(allocator, try Metadata.MetadataConfig.fromMetadata(metadata));
+    }
 }
 
+const Command = enum {
+    help,
+    exit,
+    list,
+    pub fn help(self: Command) !void {
+        const stdout = std.io.getStdOut().writer();
+        switch (self) {
+            .help => try stdout.writeAll(
+                \\Usage: help [cmd]
+                \\displays information on how to use the program, or if provided, a command
+                \\
+            ),
+            .exit => try stdout.writeAll(
+                \\Usage: exit
+                \\exits the program
+                \\
+            ),
+            .list => try stdout.writeAll(
+                \\Usage: ls [playlist]
+                \\lists the songs in a playlist
+                \\
+            )
+        }
+    }
+    fn comptimeConcat(comptime strs: [][]const u8) []const u8 {
+        comptime {
+            var n = 0;
+            for (strs) |str| {
+                n += str.len;
+            }
+            var buff: [n]u8 = undefined;
+            var offset = 0;
+            for (strs) |str| {
+                for (str, 0..) |char, i| {
+                    buff[i + offset] = char;
+                }
+                offset += str.len;
+            }
+            return &buff;
+        }
+    }
+    pub fn run(self: Command, allocator: Allocator, rest: []const u8, app: App) !void {
+        _ = allocator;
+        const writer = std.io.getStdOut().writer();
+        switch (self) {
+            .help => {
+                if (rest.len == 0) {
+                    try writer.writeAll(
+                        "Available commands:\n" ++
+                        comptime comptimeConcat( 
+                            blk: {
+                                const fields = @typeInfo(Command).Enum.fields;
+                                var names: [fields.len][]const u8 = undefined;
+                                inline for (fields, 0..) |field, i| {
+                                    names[i] = "    " ++ field.name ++ "\n";
+                                }
+                                break :blk &names;
+                            }
+                        )
+                    );
+                } else {
+                    const cmd = cmpEnum(Command, rest) orelse {
+                        try writer.print("invalid command: `{s}`\n", .{rest});
+                        return error.BadUsage;
+                    };
+                    try cmd.help();
+                }
+            },
+        .list => {
+            const playlist_name = rest;
+            const ids = blk: {
+                for (app.playlists.items) |pl| {
+                    if (std.mem.eql(u8, pl.name, playlist_name)) {
+                        break :blk pl.songs.items;
+                    }
+                    try writer.print("playlist not found: `{s}`\n", .{rest});
+                    return error.InvalidPlaylistName;
+                }
+            };
+            for (ids) |id| {
+                const song = try db.getSong(id);
+                defer song.deinit();
+                writer.print("{any}\n", song);
+            }
+        },
+        .exit => unreachable,
+        }
+    }
+};
+
+fn cmpEnum(comptime T: type, str: []const u8) ?T {
+    const info = @typeInfo(T);
+    if (info != .Enum) @compileError("T must be an enum");
+    inline for (info.Enum.fields) |field| {
+        const name = field.name;
+        if (std.mem.eql(u8, str, name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
+    const allocator = gpa.allocator();
+    defer {
+        if (gpa.deinit() != .ok) std.debug.print("whoops, we leaked :(\n", .{});
+    }
+    const app = try App.init(allocator);
+    defer app.deinit();
+
+    const readline = rl.ReadLine.init(allocator);
+    while (true) {
+        const line = try readline.getLine("> ") orelse continue;
+        defer allocator.free(line);
+        var split = std.mem.splitScalar(u8, line, ' ');
+        const cmd_str = split.next() orelse return error.NoCommand;
+        const cmd = cmpEnum(Command, cmd_str) orelse return error.InvalidCommand;
+        if (cmd == .exit) {
+            break;
+        }
+        // move index
+        const rest = split.next() orelse "";
+        cmd.run(allocator, rest, app) catch |err| {
+            switch (err) {
+                error.BadUsage => try cmd.help(),
+                else => return err
+            }
+        };
+    }
+}

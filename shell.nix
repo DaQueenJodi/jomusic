@@ -8,5 +8,8 @@ mkShell.override {
     pkg-config
     taglib
     zlib # dep for taglib
+    sqlite
+    libpulseaudio
+    readline
   ];
 }
