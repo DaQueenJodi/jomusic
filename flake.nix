@@ -1,12 +1,19 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/release-05";
-    zig-overlay = "github:mitchellh/zig-overlay";
-    zls = "github:zigtools/zls";
+    nixpkgs.url = "github:NixOS/nixpkgs/release-23.05";
+    zig-overlay.url = "github:mitchellh/zig-overlay";
+    zls.url = "github:zigtools/zls";
   };
-  {self, ...}@inputs:
+  outputs = inputs @ {
+    self,
+    nixpkgs,
+    ...
+  }:
+  let
+    pkgs = nixpkgs.legacyPackages.x86_64-linux;
+  in
   {
-    devShells."x86_64-linux".default = stdenv.mkDerivation {
+    devShells.x86_64-linux.default = pkgs.mkShell {
       packages = with pkgs; [
         pkg-config
         taglib
@@ -19,5 +26,5 @@
         (zig-overlay.packages.x86-linux.master-2023-09-09)
       ];
     };
-  }
+  };
 }
