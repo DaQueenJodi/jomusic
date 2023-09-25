@@ -21,9 +21,8 @@
         sqlite
         libpulseaudio
         readline
-
-        (zls.packages.x86-linux.default)
-        (zig-overlay.packages.x86-linux.master-2023-09-09)
+        zig
+        zls
       ];
     };
   };
