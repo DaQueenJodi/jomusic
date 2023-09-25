@@ -2,7 +2,6 @@ const c = @import("c.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-
 pub fn initAudio(allocator: Allocator) !*c.ma_engine {
     const engine = try allocator.create(c.ma_engine);
     errdefer allocator.destroy(engine);

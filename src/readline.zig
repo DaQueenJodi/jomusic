@@ -7,18 +7,14 @@ pub const ReadLine = struct {
     const Self = @This();
     pub fn init(allocator: Allocator) Self {
         c.using_history();
-        return Self {
-            .allocator = allocator
-        };
+        return Self{ .allocator = allocator };
     }
     pub fn getLine(self: Self, prompt: ?[:0]const u8) !?[]const u8 {
-        const raw = c.readline(
-            if (prompt) |p| p.ptr else null
-        );
+        const raw = c.readline(if (prompt) |p| p.ptr else null);
         defer c.free(raw);
         if (raw == null) return null;
         const dupe = try self.allocator.dupe(u8, std.mem.span(raw));
-        c.add_history(dupe.ptr);
+        //c.add_history(dupe.ptr);
         return dupe;
     }
     pub fn str(self: Self) []const u8 {

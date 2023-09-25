@@ -4,7 +4,6 @@ const Allocator = std.mem.Allocator;
 const c = @import("c.zig");
 const Song = @import("app.zig").Song;
 
-
 pub const ID = i64;
 
 pub const DB = struct {
@@ -13,9 +12,7 @@ pub const DB = struct {
     pub fn init(path: [:0]const u8) !Self {
         var sql: ?*c.sqlite3 = undefined;
         if (c.sqlite3_open(path, &sql) != c.SQLITE_OK) return error.FailedToOpenDatabase;
-        return Self {
-            .sqlite = sql
-        };
+        return Self{ .sqlite = sql };
     }
     pub fn deinit(self: Self) void {
         // assume this will always succeed; erroring in destructors is pretty stinky smelly
@@ -57,7 +54,7 @@ pub const DB = struct {
                                     const s = c.sqlite3_column_text(stmt, i);
                                     break :blk try allocator.dupe(u8, std.mem.span(s));
                                 },
-                                else => @compileError("optionals can only be i32s or strings")
+                                else => @compileError("optionals can only be i32s or strings"),
                             };
                         } else {
                             @compileError("invalid type; can only be i32, i64, or a string");
@@ -91,26 +88,22 @@ pub const DB = struct {
             },
             .Int => return std.fmt.allocPrint(allocator, "{}", .{val}),
             @typeInfo([]u8) => return try std.fmt.allocPrint(allocator, "\"{s}\"", .{val}),
-            else => @compileError("invlaid type")
+            else => @compileError("invlaid type"),
         }
     }
     pub fn addSong(self: Self, allocator: Allocator, song: Metadata) !void {
         const title = try self.formatValue(allocator, song.title);
-	defer allocator.free(title);
+        defer allocator.free(title);
         const album = try self.formatValue(allocator, song.album);
-	defer allocator.free(album);
+        defer allocator.free(album);
         const artist = try self.formatValue(allocator, song.artist);
-	defer allocator.free(artist);
+        defer allocator.free(artist);
         const year = try self.formatValue(allocator, song.year);
-	defer allocator.free(year);
+        defer allocator.free(year);
         const path = try self.formatValue(allocator, song.path);
-	defer allocator.free(path);
+        defer allocator.free(path);
 
-        const str = try std.fmt.allocPrint(
-            allocator,
-            "INSERT INTO songs (title, album, artist, year, path) values ({s}, {s}, {s}, {s}, {s})",
-            .{ title, album, artist, year, path }
-        );
+        const str = try std.fmt.allocPrint(allocator, "INSERT INTO songs (title, album, artist, year, path) values ({s}, {s}, {s}, {s}, {s})", .{ title, album, artist, year, path });
         defer allocator.free(str);
         var stmt: ?*c.sqlite3_stmt = undefined;
         if (c.sqlite3_prepare(self.sqlite, str.ptr, @intCast(str.len), &stmt, null) != c.SQLITE_OK) return error.FailedToPrepareStatement;
@@ -128,29 +121,19 @@ pub const DB = struct {
         defer allocator.free(year);
         const id = try self.formatValue(allocator, song.id);
         defer allocator.free(id);
-        const str = try std.fmt.allocPrint(
-            allocator,
-            "UPDATE songs SET title={s},album={s},artist={s},year={s} WHERE id={s}",
-            .{ title, album, artist, year, id }
-        );
+        const str = try std.fmt.allocPrint(allocator, "UPDATE songs SET title={s},album={s},artist={s},year={s} WHERE id={s}", .{ title, album, artist, year, id });
         defer allocator.free(str);
         try self.exec(str);
-
     }
     pub fn pathAdded(self: Self, allocator: Allocator, path: []const u8) !bool {
         const pathf = try self.formatValue(allocator, path);
         defer allocator.free(pathf);
-        const str = try std.fmt.allocPrint(
-            allocator,
-            "SELECT id FROM songs WHERE path={s}",
-            .{pathf}
-        );
+        const str = try std.fmt.allocPrint(allocator, "SELECT id FROM songs WHERE path={s}", .{pathf});
         defer allocator.free(str);
-        const arr = try self.query(&[_]type{ void }, allocator, str);
+        const arr = try self.query(&[_]type{void}, allocator, str);
         return arr.items.len > 0;
     }
 };
-
 
 /// creates the database file and sets up the `songs` table
 pub fn createDB(path: [:0]const u8) !void {
@@ -167,7 +150,7 @@ pub fn freeQuery(comptime R: []const type, arr: std.ArrayList(std.meta.Tuple(R))
             switch (t) {
                 []const u8 => arr.allocator.free(e[i]),
                 ?[]const u8 => if (e[i]) |v| arr.allocator.free(v),
-                else => {}
+                else => {},
             }
         }
     }

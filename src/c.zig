@@ -1,4 +1,4 @@
-pub usingnamespace  @cImport({
+pub usingnamespace @cImport({
     @cInclude("taglib/tag_c.h");
     @cInclude("miniaudio.h");
     @cInclude("sqlite3.h");
