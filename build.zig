@@ -24,17 +24,20 @@ pub fn build(b: *std.Build) void {
 
     exe.addCSourceFile(.{
         .file = b.path("vendor/all_the_audio_guys_impl.c"),
-        .flags = &.{ "-std=c11" },
+        .flags = &.{"-std=c11"},
     });
     exe.addIncludePath(b.path(""));
 
+
+    const taglib_dep = b.dependency("taglib", .{ .optimize = optimize, .target = target });
+    exe.root_module.addImport("taglib", taglib_dep.module("taglib"));
+
     const docs_path = exe.getEmittedDocs();
-    const serve_docs = b.addSystemCommand(&.{"python", "-m", "http.server", "-d"});
+    const serve_docs = b.addSystemCommand(&.{ "python", "-m", "http.server", "-d" });
     serve_docs.addDirectoryArg(docs_path);
 
     const docs_step = b.step("docs", "");
     docs_step.dependOn(&serve_docs.step);
-
 }
 
 const std = @import("std");

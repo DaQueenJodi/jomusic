@@ -24,7 +24,12 @@
     // internet connectivity.
     .dependencies = .{
         .taglib = .{
-            .path = "taglib",
+            .url = "git+https://github.com/taglib/taglib?ref=master#f3fb4d83a469fea7e23491a1dfbac14c728ac968",
+            .hash = "1220fce394b533a7ab9984b5a6a243d746655cee2b56bcb7b326d5565d6593dd9af7",
+        },
+        .@"utf8-cpp" = .{
+            .url = "git+https://github.com/nemtrif/utfcpp#df857efc5bbc2aa84012d865f7d7e9cccdc08562",
+            .hash = "12208962b52c2378751839984002eb3027083573d0b9bfbd2f3e1066583cd579f987",
         },
     },
     .paths = .{
