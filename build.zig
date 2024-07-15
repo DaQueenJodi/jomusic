@@ -28,7 +28,6 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path(""));
 
-
     const taglib_dep = b.dependency("taglib", .{ .optimize = optimize, .target = target });
     exe.root_module.addImport("taglib", taglib_dep.module("taglib"));
 

@@ -17,13 +17,12 @@ pub fn build(b: *std.Build) void {
     cpp_lib.addCSourceFiles(.{
         .root = taglib_dep.path("taglib"),
         .files = TAGLIB_SRCS,
-        .flags = &.{ "-std=c++17" },
+        .flags = &.{"-std=c++17"},
     });
 
     // (header only library)
     const utf8_cpp_dep = b.dependency("utf8-cpp", .{});
     cpp_lib.addIncludePath(utf8_cpp_dep.path("source"));
-
 
     const c_lib = b.addStaticLibrary(.{
         .name = "taglib-c",
@@ -40,7 +39,6 @@ pub fn build(b: *std.Build) void {
     for (TAGLIB_INCLUDE_DIRS) |inc| {
         c_lib.addIncludePath(taglib_dep.path(inc));
     }
-
 
     const translated_taglib_c = b.addTranslateC(.{
         .root_source_file = taglib_dep.path("bindings/c/tag_c.h"),
@@ -265,7 +263,7 @@ const TOOLKIT_SRCS = &[_][]const u8{
     "toolkit/tversionnumber.cpp",
 };
 
-const TAGLIB_SRCS = 
+const TAGLIB_SRCS =
     MPEG_SRCS ++ ID3V1_SRCS ++ ID3V2_SRCS ++ FRAMES_SRCS ++ OGG_SRCS ++
     VORBIS_SRCS ++ OGGFLACS_SRCS ++ MPC_SRCS ++ APE_SRCS ++ TOOLKIT_SRCS ++ FLACS_SRCS ++
     WAVPACK_SRCS ++ SPEEX_SRCS ++ TRUEAUDIO_SRCS ++ RIFF_SRCS ++ AIFF_SRCS ++ WAV_SRCS ++

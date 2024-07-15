@@ -126,7 +126,7 @@ const PlayableSong = struct {
     }
     pub fn deinit(ps: PlayableSong, allocator: Allocator) void {
         ps.info.deinit(allocator);
-        const mp3_multipointer: [*]align(c.MAX_ALIGNMENT) u8 = @ptrCast(ps.mp3); 
+        const mp3_multipointer: [*]align(c.MAX_ALIGNMENT) u8 = @ptrCast(ps.mp3);
         allocator.free(mp3_multipointer[0..c.sizeof_drmp3]);
     }
     pub fn readNextFrame(ps: PlayableSong) ?[2]f32 {
@@ -165,7 +165,7 @@ fn playSong(song: PlayableSong, seek_frames: u64, suspended_at_frame: *u64) !Pla
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn().reader();
     var paused = false;
-    
+
     var i: u32 = 0;
     const exit: PlaySongExitStatus = play_loop: while (true) {
         var input_buf: [1]u8 = undefined;
@@ -223,9 +223,7 @@ fn playQueue(allocator: Allocator, queue: []PlayableSong) !void {
     var curr_song_index: usize = 0;
     while (true) {
         const song = queue[curr_song_index];
-        std.log.info("playing '{s}' by '{s}' from the album '{s}' ({d})", .{
-            song.info.title, song.info.artist, song.info.album, song.info.year
-        });
+        std.log.info("playing '{s}' by '{s}' from the album '{s}' ({d})", .{ song.info.title, song.info.artist, song.info.album, song.info.year });
         var suspended_at_frame: u64 = undefined;
         switch (try playSong(song, 0, &suspended_at_frame)) {
             .user_wants_to_quit => return,
@@ -243,14 +241,14 @@ fn playQueue(allocator: Allocator, queue: []PlayableSong) !void {
                 }
             },
             .user_wants_to_edit_queue => {
-                const f = try std.fs.createFileAbsolute("/tmp/jomusic_queue", .{.truncate = true, .read = true});
+                const f = try std.fs.createFileAbsolute("/tmp/jomusic_queue", .{ .truncate = true, .read = true });
                 defer f.close();
 
                 for (queue, 0..) |q, id| {
-                    try f.writer().print("{d} #'{s}' from '{s}'\n", .{id, q.info.title, q.info.album});
+                    try f.writer().print("{d} #'{s}' from '{s}'\n", .{ id, q.info.title, q.info.album });
                 }
 
-                var child = std.process.Child.init(&.{"nvim", "/tmp/jomusic_queue"}, allocator);
+                var child = std.process.Child.init(&.{ "nvim", "/tmp/jomusic_queue" }, allocator);
                 _ = try child.spawnAndWait();
 
                 try f.seekTo(0);
@@ -259,7 +257,6 @@ fn playQueue(allocator: Allocator, queue: []PlayableSong) !void {
                 const real_len = try f.readAll(buf);
                 // should always be true since its a regular file
                 assert(real_len == file_len);
-
 
                 const queue_copy = try allocator.dupe(PlayableSong, queue);
                 defer allocator.free(queue_copy);
