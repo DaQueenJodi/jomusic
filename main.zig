@@ -9,14 +9,14 @@ pub fn main() !void {
     const allocator = arena.allocator();
     defer arena.deinit();
 
-    var iter = try std.process.argsWithAllocator(allocator);
-    defer iter.deinit();
+    var args_iter = try std.process.argsWithAllocator(allocator);
+    defer args_iter.deinit();
 
-    _ = iter.next() orelse @panic("not a sane environment");
+    _ = args_iter.next() orelse @panic("not a sane environment");
 
-    const action_str = iter.next() orelse printHelp(null);
+    const action_str = args_iter.next() orelse printHelp(null);
     if (isHelp(action_str)) {
-        const actual_action_str = iter.next() orelse printHelp(null);
+        const actual_action_str = args_iter.next() orelse printHelp(null);
         const actual_action = std.meta.stringToEnum(Action, actual_action_str) orelse {
             std.log.err("Invalid action: '{s}'", .{actual_action_str});
             printHelp(null);
@@ -42,7 +42,7 @@ pub fn main() !void {
             defer queue.deinit(allocator);
 
             var did_a_thing = false;
-            while (iter.next()) |path| {
+            while (args_iter.next()) |path| {
                 did_a_thing = true;
                 const file = std.fs.cwd().openFile(path, .{}) catch |err| {
                     die("failed to open file '{s}': {s}.", .{ path, @errorName(err) });
@@ -68,7 +68,98 @@ pub fn main() !void {
                 printHelp(.play);
             }
         },
+        .add => {
+            const path = args_iter.next() orelse {
+                std.log.err("expected file path argument", .{});
+                printHelp(.add);
+            };
+
+            const f = std.fs.cwd().openFile(path, .{}) catch |err| {
+                die("failed to open file '{s}': {s}", .{ path, @errorName(err) });
+            };
+            const f_len = f.getEndPos() catch |err| {
+                die("failed to seek file '{s}': {s}. Is this a regular file?", .{ path, @errorName(err) });
+            };
+
+            const buf = try allocator.alloc(u8, f_len);
+            defer allocator.free(buf);
+
+            const real_len = f.readAll(buf) catch |err| {
+                die("failed to read file '{s}': {s}", .{ path, @errorName(err) });
+            };
+            if (real_len != f_len) die("file length mismatch while reading '{s}'. Is it a regular file?", .{path});
+
+            const song_info = SongInfo.init(buf) catch {
+                die("failed to get metadata for file '{s}', are you sure it's an MP3 file?", .{path});
+            };
+
+            var db = openDB();
+            defer db.deinit();
+
+            var diags: sql.Diagnostics = .{};
+            const query = "INSERT INTO songs (title, file_contents, album, artist, year) VALUES (?,?,?,?,?)";
+            db.exec(query, .{ .diags = &diags }, .{ song_info.title, buf, song_info.album, song_info.artist, song_info.year }) catch |err| {
+                switch (err) {
+                    error.SQLiteConstraintUnique => die("this file is already in the database, not adding!", .{}),
+                    else => |e| die("failed to execute query '{s}': {s}: {}", .{ query, @errorName(e), diags }),
+                }
+            };
+        },
+        .list => {
+            var db = openDB();
+            defer db.deinit();
+            const songs_query = "SELECT title, album, artist, year FROM songs";
+            var stmt = db.prepare(songs_query) catch unreachable;
+            defer stmt.deinit();
+            var song_iter = stmt.iterator(struct { []const u8, []const u8, []const u8, u16 }, .{}) catch |err| {
+                die("failed to create song iterator: '{s}'", .{@errorName(err)});
+            };
+
+            const stdout = std.io.getStdOut().writer();
+            var bw = std.io.bufferedWriter(stdout);
+            defer bw.flush() catch {};
+
+            const writer = bw.writer();
+
+            var diags: sql.Diagnostics = .{};
+            while (song_iter.nextAlloc(allocator, .{ .diags = &diags }) catch |err| {
+                die("failed to iterate over songs: '{s}': {}", .{ @errorName(err), diags });
+            }) |row| {
+                const title, const album, const artist, const year = row;
+                writer.print("'{s}' from '{s}' ({d}) by '{s}'\n", .{ title, album, year, artist }) catch {};
+            }
+        },
     }
+}
+
+fn openDB() sql.Db {
+    var diags: sql.Diagnostics = .{};
+    var db = sql.Db.init(.{
+        .mode = .{ .File = "jomusic.db" },
+        .open_flags = .{ .write = true, .create = true },
+        .diags = &diags,
+    }) catch |err| {
+        die("failed to open jomusic database: {s}: {}", .{ @errorName(err), diags });
+    };
+    errdefer db.deinit();
+
+    if (sql.c.sqlite3_extended_result_codes(db.db, 1) != sql.c.SQLITE_OK) {
+        die("failed to enable extended result codes", .{});
+    }
+    setupDBIfNeeded(&db);
+
+    return db;
+}
+
+fn setupDBIfNeeded(db: *sql.Db) void {
+    var diags: sql.Diagnostics = .{};
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS songs (id INTEGER PRIMARY KEY, file_contents BLOB UNIQUE NOT NULL , title TEXT NOT NULL, album TEXT, artist TEXT NOT NULL, year INTEGER NOT NULL)",
+        .{ .diags = &diags },
+        .{},
+    ) catch |err| {
+        die("failed to set up database: {s}: {}", .{ @errorName(err), diags });
+    };
 }
 
 const Song = struct {
@@ -76,9 +167,9 @@ const Song = struct {
 };
 
 const SongInfo = struct {
-    title: [*:0]const u8,
-    artist: [*:0]const u8,
-    album: [*:0]const u8,
+    title: [:0]const u8,
+    artist: [:0]const u8,
+    album: [:0]const u8,
     year: c_uint,
     pub fn init(buffer: []const u8) !SongInfo {
         const tag_iostream = tl.taglib_memory_iostream_new(buffer.ptr, @intCast(buffer.len));
@@ -89,9 +180,9 @@ const SongInfo = struct {
         const tag = tl.taglib_file_tag(tag_file);
 
         return .{
-            .title = tl.taglib_tag_title(tag),
-            .artist = tl.taglib_tag_artist(tag),
-            .album = tl.taglib_tag_album(tag),
+            .title = std.mem.span(tl.taglib_tag_title(tag)),
+            .artist = std.mem.span(tl.taglib_tag_artist(tag)),
+            .album = std.mem.span(tl.taglib_tag_album(tag)),
             .year = tl.taglib_tag_year(tag),
         };
     }
@@ -352,6 +443,16 @@ fn printHelp(action: ?Action) noreturn {
             \\  play <FILE 0> <FILE 1> ...<FILE N>             Play files in single-shot mode.
             \\
         ) catch {},
+        .add => stderr.writeAll(
+            \\Usage:
+            \\  add <FILE>  Add a file to the database with metadata.
+            \\
+        ) catch {},
+        .list => stderr.writeAll(
+            \\Usage:
+            \\  list        list songs in the database.
+            \\
+        ) catch {},
     }
 
     std.process.exit(1);
@@ -382,13 +483,30 @@ pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_
     @call(.always_inline, std.builtin.default_panic, .{ msg, error_return_trace, ret_addr });
 }
 
+
+pub const std_options = .{
+    .logFn = logThatExcludesSQL,
+};
+
+pub fn logThatExcludesSQL(comptime level: std.log.Level, comptime scope: @TypeOf(.EnumLiteral), comptime format: []const u8, args: anytype) void {
+    if (scope == .sqlite) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
 inline fn die(comptime fmt: []const u8, args: anytype) noreturn {
-    std.io.getStdErr().writer().print(fmt, args) catch {};
-    std.process.exit(1);
+    switch (builtin.mode) {
+        .Debug => std.debug.panic(fmt, args),
+        else => {
+            std.log.err(fmt, args);
+            std.process.exit(1);
+        },
+    }
 }
 
 const Action = enum {
     play,
+    add,
+    list,
 };
 
 const FileType = enum {
@@ -396,7 +514,9 @@ const FileType = enum {
 };
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tl = @import("taglib");
+const sql = @import("sqlite");
 const c = @import("c.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;

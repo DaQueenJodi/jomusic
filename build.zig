@@ -1,7 +1,10 @@
 pub fn build(b: *std.Build) void {
+
+    const should_install = b.option(bool, "install", "") orelse false;
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const llvm = b.option(bool, "llvm", "") orelse false;
+    const llvm = b.option(bool, "llvm", "") orelse true;
     const exe = b.addExecutable(.{
         .name = "jomusic",
         .root_source_file = b.path("main.zig"),
@@ -10,7 +13,11 @@ pub fn build(b: *std.Build) void {
         .use_llvm = llvm,
         .use_lld = llvm,
     });
-    b.installArtifact(exe);
+    if (should_install) {
+        b.installArtifact(exe);
+    } else {
+        b.getInstallStep().dependOn(&exe.step);
+    }
 
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);
@@ -30,6 +37,10 @@ pub fn build(b: *std.Build) void {
 
     const taglib_dep = b.dependency("taglib", .{ .optimize = optimize, .target = target });
     exe.root_module.addImport("taglib", taglib_dep.module("taglib"));
+
+    const sqlite_dep = b.dependency("sqlite", .{});
+    exe.root_module.addImport("sqlite", sqlite_dep.module("sqlite"));
+    exe.linkLibrary(sqlite_dep.artifact("sqlite"));
 
     const docs_path = exe.getEmittedDocs();
     const serve_docs = b.addSystemCommand(&.{ "python", "-m", "http.server", "-d" });
