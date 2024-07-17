@@ -42,31 +42,29 @@ pub fn main() !void {
             defer queue.deinit(allocator);
 
             var did_a_thing = false;
-            while (args_iter.next()) |path| {
-                did_a_thing = true;
-                const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-                    die("failed to open file '{s}': {s}.", .{ path, @errorName(err) });
-                };
-                const buffer_len = file.getEndPos() catch |err| {
-                    die("failed to get length of file '{s}': {s}", .{ path, @errorName(err) });
-                };
-                const buffer = try allocator.alloc(u8, buffer_len);
-                const read_len = file.readAll(buffer) catch |err| {
-                    die("failed to read file '{s}': {s}", .{ path, @errorName(err) });
-                };
-                if (read_len != buffer_len) {
-                    die("failed to read file '{s}': expected {d} bytes, got {d}. Is this a regular file?", .{ path, buffer_len, read_len });
-                }
 
+
+            var db = openDB();
+            defer db.deinit();
+            while (args_iter.next()) |id_str| {
+                const id = std.fmt.parseInt(usize, id_str, 10) catch die("expected id argument to be a number, got: '{s}'", .{id_str});
+                did_a_thing = true;
+
+                var diags: sql.Diagnostics = .{};
+                const query = "SELECT file_contents FROM songs AS s WHERE s.id = ?";
+                const maybe_buffer = db.oneAlloc([]const u8, allocator, query, .{.diags = &diags}, .{id}) catch |err| {
+                    die("failed to get song with ID '{d}': {s}: {s}", .{id, @errorName(err), diags});
+                };
+                const buffer = maybe_buffer orelse die("no song found for id: {d}", .{id});
                 try queue.append(allocator, try PlayableSong.init(allocator, buffer));
+            }
+            if (!did_a_thing) {
+                std.log.err("expected an argument", .{});
+                printHelp(.play);
             }
 
             try playQueue(allocator, queue.items);
 
-            if (!did_a_thing) {
-                std.log.err("expected a file argument", .{});
-                printHelp(.play);
-            }
         },
         .add => {
             const path = args_iter.next() orelse {
@@ -108,10 +106,10 @@ pub fn main() !void {
         .list => {
             var db = openDB();
             defer db.deinit();
-            const songs_query = "SELECT title, album, artist, year FROM songs";
+            const songs_query = "SELECT id, title, album, artist, year FROM songs";
             var stmt = db.prepare(songs_query) catch unreachable;
             defer stmt.deinit();
-            var song_iter = stmt.iterator(struct { []const u8, []const u8, []const u8, u16 }, .{}) catch |err| {
+            var song_iter = stmt.iterator(struct { u64, []const u8, []const u8, []const u8, u16 }, .{}) catch |err| {
                 die("failed to create song iterator: '{s}'", .{@errorName(err)});
             };
 
@@ -125,8 +123,8 @@ pub fn main() !void {
             while (song_iter.nextAlloc(allocator, .{ .diags = &diags }) catch |err| {
                 die("failed to iterate over songs: '{s}': {}", .{ @errorName(err), diags });
             }) |row| {
-                const title, const album, const artist, const year = row;
-                writer.print("'{s}' from '{s}' ({d}) by '{s}'\n", .{ title, album, year, artist }) catch {};
+                const id, const title, const album, const artist, const year = row;
+                writer.print("{d}: '{s}' from '{s}' ({d}) by '{s}'\n", .{ id, title, album, year, artist }) catch {};
             }
         },
     }
@@ -434,13 +432,15 @@ fn printHelp(action: ?Action) noreturn {
             \\
             \\  Use -h or --help with any subcommand to get information about that subcommand
             \\  Actions:
-            \\      play        Play some music files in single shot mode.
+            \\      play        Play some music from the database
+            \\      add         Add music to the database
+            \\      list        List music in the database
             \\  
         ) catch {};
     } else switch (action.?) {
         .play => stderr.writeAll(
             \\Usage:
-            \\  play <FILE 0> <FILE 1> ...<FILE N>             Play files in single-shot mode.
+            \\  play <ID 1> <ID 2> <ID N>     Play songs from the database using an ID.
             \\
         ) catch {},
         .add => stderr.writeAll(
@@ -497,6 +497,7 @@ inline fn die(comptime fmt: []const u8, args: anytype) noreturn {
     switch (builtin.mode) {
         .Debug => std.debug.panic(fmt, args),
         else => {
+            if (global_tui_thingmabob_just_for_the_panic_handler_to_be_able_to_unset_it_if_it_has_to_lol) |t| setTui(t);
             std.log.err(fmt, args);
             std.process.exit(1);
         },
