@@ -24,6 +24,22 @@ pub fn main() !void {
 
     switch (action) {
         .play => blk: {
+
+            // accumulate queue
+            var queue = std.ArrayList(u64).init(allocator);
+            defer queue.deinit();
+
+            var db = openDB();
+            defer db.deinit();
+            while (args_iter.next()) |id_str| {
+                const id = std.fmt.parseInt(usize, id_str, 10) catch die("expected id argument to be a number, got: '{s}'", .{id_str});
+                try queue.append(id);
+            }
+            if (queue.items.len == 0) {
+                std.log.err("expected at least one argument", .{});
+                printHelp(.play);
+            }
+
             const old = enterTui();
             global_tui_thingmabob_just_for_the_panic_handler_to_be_able_to_unset_it_if_it_has_to_lol = old;
             defer {
@@ -31,34 +47,153 @@ pub fn main() !void {
                 setTui(old);
             }
 
-            var queue: std.ArrayListUnmanaged(PlayableSong) = .{};
-            defer for (queue.items) |ps| ps.deinit(allocator);
-            defer queue.deinit(allocator);
+            var in_background = false;
+            var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song } = .normal;
+            var curr_song_idx: u32 = 0;
 
-            var did_a_thing = false;
+            const stdout = std.io.getStdOut().writer();
+            const stdin = std.io.getStdIn().reader();
 
-            var db = openDB();
-            defer db.deinit();
-            while (args_iter.next()) |id_str| {
-                const id = std.fmt.parseInt(usize, id_str, 10) catch die("expected id argument to be a number, got: '{s}'", .{id_str});
-
-                const ps = PlayableSong.initFromDB(&db, allocator, id) catch |err| switch (err) {
-                    error.SongNotFound => {
-                        std.log.info("song with ID '{d}' does not exist!", .{id});
-                        break :blk;
+            // only valid while `in_background` is true
+            var running_process_id: std.posix.pid_t = undefined;
+            //  actually play the queue
+            outer: while (true) {
+                switch (state) {
+                    .exit => {
+                        stdout.writeAll("\x1B[2K\x1B[1G(exitted)\n") catch {};
+                        break;
                     },
-                    error.OutOfMemory => |e| return e,
-                };
+                    .next_song => {
+                        curr_song_idx += 1;
+                        state = .normal;
+                        stdout.writeAll("\x1B[2K\x1B[1G(skipped)\n") catch {};
+                    },
+                    .next_song_normal => {
+                        curr_song_idx += 1;
+                        state = .normal;
+                        stdout.writeAll("\x1B[2K\x1B[1G(done)\n") catch {};
+                    },
+                    .prev_song => {
+                        curr_song_idx -= 1;
+                        state = .normal;
+                        stdout.writeAll("\x1B[2K\x1B[1G(skipped)\n") catch {};
+                    },
+                    .paused => unreachable,
+                    .normal => {
+                        const id = queue.items[curr_song_idx];
+                        const song = PlayableSong.initFromDB(&db, allocator, id) catch |err| switch (err) {
+                            error.SongNotFound => {
+                                // TODO: make this not bad lol
+                                if (!in_background) {
+                                    std.log.info("song with ID '{d}' does not exist! skipping..", .{id});
+                                }
+                                break :blk;
+                            },
+                            error.OutOfMemory => |e| return e,
+                        };
+                        defer song.deinit(allocator);
 
-                did_a_thing = true;
-                try queue.append(allocator, ps);
-            }
-            if (!did_a_thing) {
-                std.log.err("expected an argument", .{});
-                printHelp(.play);
-            }
+                        if (!in_background) {
+                            if (song.info.album) |album| {
+                                std.log.info("playing '{s}' from '{s}' by '{s}'", .{song.info.title, album, song.info.artist});
+                            } else {
+                                std.log.info("playing '{s}' by '{s}'", .{song.info.title, song.info.artist});
+                            }
+                        }
 
-            try playQueue(allocator, queue.items);
+                        const channels: u8 = @intCast(c.drmp3_channels(song.mp3));
+                        const sample_rate = c.drmp3_sample_rate(song.mp3);
+
+                        const total_pcm_count = c.drmp3_get_pcm_frame_count(song.mp3);
+                        const length_in_secs = @divFloor(total_pcm_count, sample_rate);
+
+                        const pulse_stream = initPulse(@intCast(channels), sample_rate);
+                        defer c.pa_simple_free(pulse_stream);
+
+
+                        var i: u32 = 0;
+                        inner: while (true) {
+                            const input = if (in_background) 0 else readByteOrZero(stdin);
+                            switch (input) {
+                                // just a stub for ergonomics
+                                '\x00' => {},
+                                // next
+                                'n' => {
+                                    state = .next_song;
+                                    continue :outer;
+                                },
+                                // previous
+                                'p' => {
+                                    state = .prev_song;
+                                    continue :outer;
+                                },
+                                // quit
+                                'e' => {
+                                    state = .exit;
+                                    continue :outer;
+                                },
+                                // queue
+                                'q' => {
+                                    var child = std.process.Child.init(&.{"nvim"}, allocator);
+                                    child.spawn() catch |err| {
+                                        die("failed to spawn nvim process: {s}", .{@errorName(err)});
+                                    };
+                                    running_process_id = child.id;
+                                    in_background = true;
+                                },
+                                // lyrics
+                                'l' => {
+                                    var child = std.process.Child.init(&.{"less"}, allocator);
+                                    child.stdin_behavior = .Pipe;
+                                    child.spawn() catch |err| {
+                                        die("failed to spawn process: {s}", .{@errorName(err)});
+                                    };
+
+                                    const f = child.stdin.?;
+                                    f.writer().writeAll("haiiiiiiiiiiiiiiiiiiiiiiiiiii") catch {};
+
+                                    running_process_id = child.id;
+                                    in_background = true;
+
+                                },
+                                // toggle pause
+                                ' ' => state = switch (state) {
+                                    .paused => .normal,
+                                    .normal => .paused,
+                                    else => unreachable,
+                                },
+                                else => {},
+                            }
+                            if (state == .paused) continue :inner;
+
+                            if (!in_background and i % sample_rate == 0) {
+                                // clear line
+                                stdout.writeAll("\x1B[2K\x1B[1G") catch {};
+                                stdout.print("{}/{}", .{
+                                    fmtSecs(@divFloor(i, sample_rate)),
+                                    fmtSecs(length_in_secs),
+                                }) catch {};
+                            }
+                            if (song.readNextFrame()) |frame| {
+                                pulseWrite(pulse_stream, std.mem.sliceAsBytes(frame[0..channels]));
+                            } else {
+                                state = .next_song;
+                                break :inner;
+                            }
+
+
+                            // poll if background process is done
+                            if (in_background) {
+                                const ret = waitpid(running_process_id, null, std.os.linux.W.NOHANG);
+                                if (ret > 0) in_background = false;
+                            }
+
+                            i += 1;
+                        }
+                        pulseDrain(pulse_stream);
+                    },
+                }
+            }
         },
         .add => {
             // we want to manage strings ourselves so we dont need to dupe anything
@@ -164,6 +299,14 @@ pub fn main() !void {
         },
     }
 }
+
+fn readByteOrZero(reader: anytype) u8 {
+    var buf: [1]u8 = undefined;
+    const len = reader.read(&buf) catch 0;
+    if (len == 0) return 0;
+    return buf[0];
+}
+
 fn haveUserFillInMissingFields(arena: Allocator, found_metadata: MusicFileMetadata) !SongInfo {
     var si: SongInfo = undefined;
     const stdout = std.io.getStdOut().writer();
@@ -525,152 +668,6 @@ const PlaySongExitStatus = enum {
     user_wants_to_edit_queue,
     done_playing_normally,
 };
-// suspended_at_frame is only set if the exit status is .user_wants_prev_song or .user_wants_edit_queue
-fn playSong(song: PlayableSong, seek_frames: u64, suspended_at_frame: *u64) !PlaySongExitStatus {
-    if (seek_frames > 0) {
-        if (c.drmp3_seek_to_pcm_frame(song.mp3, seek_frames) == c.DRMP3_FALSE) {
-            std.log.err("failed to seek stream :(, playing from the beginning", .{});
-        }
-    }
-
-    const channels: u8 = @intCast(c.drmp3_channels(song.mp3));
-    const sample_rate = c.drmp3_sample_rate(song.mp3);
-
-    const total_pcm_count = c.drmp3_get_pcm_frame_count(song.mp3);
-    const length_in_secs = @divFloor(total_pcm_count, sample_rate);
-
-    const pulse_stream = initPulse(@intCast(channels), sample_rate);
-    defer c.pa_simple_free(pulse_stream);
-
-    const stdout = std.io.getStdOut().writer();
-    const stdin = std.io.getStdIn().reader();
-    var paused = false;
-
-    var i: u32 = 0;
-    const exit: PlaySongExitStatus = play_loop: while (true) {
-        var input_buf: [1]u8 = undefined;
-        const len = try stdin.read(&input_buf);
-        if (len > 0) {
-            switch (input_buf[0]) {
-                // next
-                'n' => break :play_loop .user_wants_next_song,
-                // previous
-                'p' => break :play_loop .user_wants_prev_song,
-                // quit
-                'e' => break :play_loop .user_wants_to_quit,
-                // queue
-                'q' => break :play_loop .user_wants_to_edit_queue,
-                // toggle pause
-                ' ' => paused = !paused,
-                else => {},
-            }
-        }
-        if (paused) continue;
-        if (i % sample_rate == 0) {
-            // clear line
-            stdout.writeAll("\x1B[2K\x1B[1G") catch {};
-            stdout.print("{}/{}", .{
-                fmtSecs(@divFloor(i, sample_rate)),
-                fmtSecs(length_in_secs),
-            }) catch {};
-        }
-        if (song.readNextFrame()) |frame| {
-            pulseWrite(pulse_stream, std.mem.sliceAsBytes(frame[0..channels]));
-        } else break :play_loop .done_playing_normally;
-
-        i += 1;
-    };
-    pulseDrain(pulse_stream);
-    // clear line
-    stdout.writeAll("\x1B[2K\x1B[1G") catch {};
-    stdout.writeAll(switch (exit) {
-        .done_playing_normally => "(done)\n",
-        .user_wants_next_song => "(skipped ↓)\n",
-        .user_wants_prev_song => "(skipped ↑)\n",
-        .user_wants_to_quit => "(exited)\n",
-        .user_wants_to_edit_queue => "",
-    }) catch {};
-
-    switch (exit) {
-        .user_wants_prev_song, .user_wants_to_edit_queue => suspended_at_frame.* = i,
-        else => {},
-    }
-
-    return exit;
-}
-
-fn playQueue(allocator: Allocator, queue: []PlayableSong) !void {
-    var curr_song_index: usize = 0;
-    while (true) {
-        const song = queue[curr_song_index];
-        const si = song.info;
-        if (si.album) |album| {
-            std.log.info("playing '{s}' by '{s}' from the album '{s}' ({d})", .{ si.title, si.artist, album, si.year });
-        } else {
-            std.log.info("playing '{s}' ({d}) by '{s}'", .{ si.title, si.year, si.artist });
-        }
-        var suspended_at_frame: u64 = undefined;
-        switch (try playSong(song, 0, &suspended_at_frame)) {
-            .user_wants_to_quit => return,
-            .user_wants_next_song => {
-                curr_song_index = (curr_song_index + 1) % queue.len;
-            },
-            .done_playing_normally => {
-                curr_song_index += 1;
-                // exit if we just finished the last song
-                if (curr_song_index == queue.len) return;
-            },
-            .user_wants_prev_song => {
-                if (suspended_at_frame < 1_000) {
-                    curr_song_index -|= 1;
-                }
-            },
-            .user_wants_to_edit_queue => {
-                const f = try std.fs.createFileAbsolute("/tmp/jomusic_queue", .{ .truncate = true, .read = true });
-                defer f.close();
-
-                for (queue, 0..) |q, id| {
-                    if (q.info.album) |album| {
-                        try f.writer().print("{d} #'{s}' by '{s}' from '{s}'\n", .{ id, q.info.title, album, q.info.artist });
-                    } else {
-                        try f.writer().print("{d} #'{s}' by '{s}'\n", .{ id, q.info.title, q.info.artist });
-                    }
-                }
-
-                var child = std.process.Child.init(&.{ "nvim", "/tmp/jomusic_queue" }, allocator);
-                _ = try child.spawnAndWait();
-
-                try f.seekTo(0);
-                const file_len = try f.getEndPos();
-                const buf = try allocator.alloc(u8, file_len);
-                defer allocator.free(buf);
-                const real_len = try f.readAll(buf);
-                // should always be true since its a regular file
-                assert(real_len == file_len);
-
-                const queue_copy = try allocator.dupe(PlayableSong, queue);
-                defer allocator.free(queue_copy);
-
-                var lines_iter = std.mem.splitScalar(u8, buf, '\n');
-                var i: usize = 0;
-                while (lines_iter.next()) |line| : (i += 1) {
-                    if (line.len == 0) continue;
-                    const space = std.mem.indexOfAny(u8, line, " #") orelse line.len;
-                    const num_str = line[0..space];
-                    const num = try std.fmt.parseInt(usize, num_str, 10);
-
-                    queue[i] = queue[num];
-
-                    if (queue.len == 0) {
-                        std.log.info("queue is empty, exiting", .{});
-                        return;
-                    }
-                    curr_song_index = @min(queue.len - 1, curr_song_index);
-                }
-            },
-        }
-    }
-}
 
 inline fn fmtSecs(secs: u64) FmtSecs {
     return .{ .secs = secs };
@@ -812,6 +809,11 @@ inline fn die(comptime fmt: []const u8, args: anytype) noreturn {
 
 const MAX_SONG_COLUMN_LEN = 25;
 const ELLIPSIS = "...";
+
+// same as std.os.linux but status is allowed to be NULL
+fn waitpid(pid: std.os.linux.pid_t, status: ?*u32, flags: u32) usize {
+    return std.os.linux.syscall4(.wait4, @as(usize, @bitCast(@as(isize, pid))), @intFromPtr(status), flags, 0);
+}
 
 const Action = enum {
     play,
