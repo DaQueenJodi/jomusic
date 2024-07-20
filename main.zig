@@ -48,6 +48,7 @@ pub fn main() !void {
             }
 
             var in_background = false;
+            var fetching_lyrics = false;
             var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song } = .normal;
             var curr_song_idx: u32 = 0;
 
@@ -56,6 +57,13 @@ pub fn main() !void {
 
             // only valid while `in_background` is true
             var running_process_id: std.posix.pid_t = undefined;
+
+            // should only be accessed by the lyric fetching thread or when it's done working
+            var lyric_thread_arena_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            const lyric_thread_arena = lyric_thread_arena_impl.allocator();
+            var fetched_lyrics = std.ArrayList(u8).init(lyric_thread_arena);
+            // only valid while `fetching_lyrics` is true
+            var lyrics_fetching_thread_state: FetchingState = undefined;
             //  actually play the queue
             outer: while (true) {
                 switch (state) {
@@ -84,7 +92,7 @@ pub fn main() !void {
                         const song = PlayableSong.initFromDB(&db, allocator, id) catch |err| switch (err) {
                             error.SongNotFound => {
                                 // TODO: make this not bad lol
-                                if (!in_background) {
+                                if (!in_background and !fetching_lyrics) {
                                     std.log.info("song with ID '{d}' does not exist! skipping..", .{id});
                                 }
                                 break :blk;
@@ -93,11 +101,11 @@ pub fn main() !void {
                         };
                         defer song.deinit(allocator);
 
-                        if (!in_background) {
+                        if (!in_background and !fetching_lyrics) {
                             if (song.info.album) |album| {
-                                std.log.info("playing '{s}' from '{s}' by '{s}'", .{song.info.title, album, song.info.artist});
+                                std.log.info("playing '{s}' from '{s}' by '{s}'", .{ song.info.title, album, song.info.artist });
                             } else {
-                                std.log.info("playing '{s}' by '{s}'", .{song.info.title, song.info.artist});
+                                std.log.info("playing '{s}' by '{s}'", .{ song.info.title, song.info.artist });
                             }
                         }
 
@@ -110,10 +118,9 @@ pub fn main() !void {
                         const pulse_stream = initPulse(@intCast(channels), sample_rate);
                         defer c.pa_simple_free(pulse_stream);
 
-
                         var i: u32 = 0;
                         inner: while (true) {
-                            const input = if (in_background) 0 else readByteOrZero(stdin);
+                            const input = if (in_background or fetching_lyrics) 0 else readByteOrZero(stdin);
                             switch (input) {
                                 // just a stub for ergonomics
                                 '\x00' => {},
@@ -143,18 +150,23 @@ pub fn main() !void {
                                 },
                                 // lyrics
                                 'l' => {
-                                    var child = std.process.Child.init(&.{"less"}, allocator);
-                                    child.stdin_behavior = .Pipe;
-                                    child.spawn() catch |err| {
-                                        die("failed to spawn process: {s}", .{@errorName(err)});
+                                    fetching_lyrics = true;
+                                    lyrics_fetching_thread_state.done = false;
+
+                                    var diags: sql.Diagnostics = .{};
+                                    const maybe_lrc_id = db.one(u64, "SELECT lrc_id FROM lyrics WHERE song_id=?", .{ .diags = &diags }, .{id}) catch |err| {
+                                        die("failed to get lyrics from lyrics database: {s}: {}", .{ @errorName(err), diags });
                                     };
 
-                                    const f = child.stdin.?;
-                                    f.writer().writeAll("haiiiiiiiiiiiiiiiiiiiiiiiiiii") catch {};
-
-                                    running_process_id = child.id;
-                                    in_background = true;
-
+                                    const t = std.Thread.spawn(
+                                        .{},
+                                        fetchLyricsThreadFn,
+                                        .{ &lyrics_fetching_thread_state, &fetched_lyrics, song.info, maybe_lrc_id },
+                                    ) catch |err| {
+                                        die("failed to fetch lyrics: {s}", .{@errorName(err)});
+                                    };
+                                    t.detach();
+                                    stdout.writeAll("\x1B[2K\x1B[1Gfetching lyrics..") catch {};
                                 },
                                 // toggle pause
                                 ' ' => state = switch (state) {
@@ -164,9 +176,8 @@ pub fn main() !void {
                                 },
                                 else => {},
                             }
-                            if (state == .paused) continue :inner;
 
-                            if (!in_background and i % sample_rate == 0) {
+                            if (!fetching_lyrics and !in_background and i % sample_rate == 0) {
                                 // clear line
                                 stdout.writeAll("\x1B[2K\x1B[1G") catch {};
                                 stdout.print("{}/{}", .{
@@ -174,21 +185,51 @@ pub fn main() !void {
                                     fmtSecs(length_in_secs),
                                 }) catch {};
                             }
-                            if (song.readNextFrame()) |frame| {
-                                pulseWrite(pulse_stream, std.mem.sliceAsBytes(frame[0..channels]));
-                            } else {
-                                state = .next_song;
-                                break :inner;
+                            if (state != .paused) {
+                                if (song.readNextFrame()) |frame| {
+                                    pulseWrite(pulse_stream, std.mem.sliceAsBytes(frame[0..channels]));
+                                    i += 1;
+                                } else {
+                                    state = .next_song;
+                                    break :inner;
+                                }
                             }
 
-
-                            // poll if background process is done
+                            // poll if running process is done
                             if (in_background) {
                                 const ret = waitpid(running_process_id, null, std.os.linux.W.NOHANG);
-                                if (ret > 0) in_background = false;
+                                if (ret > 0) {
+                                    in_background = false;
+                                    running_process_id = undefined;
+                                }
                             }
+                            // poll if thread is done fetching
+                            // if it is, start the pager process
+                            if (fetching_lyrics) {
+                                const done = @atomicLoad(bool, &lyrics_fetching_thread_state.done, .monotonic);
+                                if (done) {
+                                    fetching_lyrics = false;
 
-                            i += 1;
+                                    if (lyrics_fetching_thread_state.fetched_lrc_id) |lrc_id| {
+                                        var diags: sql.Diagnostics = .{};
+                                        db.exec(
+                                            "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
+                                            .{ .diags = &diags },
+                                            .{ id, lrc_id },
+                                        ) catch |err| {
+                                            die("failed to insert lyrics into table: {s}: {}", .{ @errorName(err), diags });
+                                        };
+                                    }
+
+                                    lyrics_fetching_thread_state = undefined;
+
+                                    const pid = try spawnPagerWithLyrics(fetched_lyrics.items);
+                                    defer fetched_lyrics.clearRetainingCapacity();
+
+                                    running_process_id = pid;
+                                    in_background = true;
+                                }
+                            }
                         }
                         pulseDrain(pulse_stream);
                     },
@@ -575,7 +616,14 @@ fn openDB() sql.Db {
 fn setupDBIfNeeded(db: *sql.Db) void {
     var diags: sql.Diagnostics = .{};
     db.exec(
-        "CREATE TABLE IF NOT EXISTS songs (id INTEGER PRIMARY KEY, file_contents BLOB UNIQUE NOT NULL , title TEXT NOT NULL, album TEXT, artist TEXT NOT NULL, year INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS songs (id INTEGER PRIMARY KEY, file_contents BLOB UNIQUE NOT NULL, title TEXT NOT NULL, album TEXT, artist TEXT NOT NULL, year INTEGER NOT NULL)",
+        .{ .diags = &diags },
+        .{},
+    ) catch |err| {
+        die("failed to set up database: {s}: {}", .{ @errorName(err), diags });
+    };
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS lyrics (id INTEGER PRIMARY KEY, lrc_id INTEGER NOT NULL, song_id INTEGER UNIQUE NOT NULL)",
         .{ .diags = &diags },
         .{},
     ) catch |err| {
@@ -696,12 +744,11 @@ inline fn pulseDrain(pulse_stream: *c.pa_simple) void {
 }
 
 fn initPulse(channels: u8, rate: u32) *c.pa_simple {
-    _ = rate;
     // taken from https://www.freedesktop.org/software/pulseaudio/doxygen/simple.html#conn_sec
     const spec: c.pa_sample_spec = .{
         .format = c.PA_SAMPLE_FLOAT32,
         .channels = channels,
-        .rate = 44100,
+        .rate = rate,
     };
     var err: c_int = undefined;
     return c.pa_simple_new(null, "jomusic", c.PA_STREAM_PLAYBACK, null, "Music", &spec, null, null, &err) orelse {
@@ -813,6 +860,94 @@ const ELLIPSIS = "...";
 // same as std.os.linux but status is allowed to be NULL
 fn waitpid(pid: std.os.linux.pid_t, status: ?*u32, flags: u32) usize {
     return std.os.linux.syscall4(.wait4, @as(usize, @bitCast(@as(isize, pid))), @intFromPtr(status), flags, 0);
+}
+
+fn spawnPagerWithLyrics(text: []const u8) !std.posix.pid_t {
+    const read_pipe, const write_pipe = try std.posix.pipe2(.{});
+
+    const fork_pid = try std.posix.fork();
+    if (fork_pid == 0) {
+        // we are the child
+        std.posix.close(write_pipe);
+        try std.posix.dup2(read_pipe, std.posix.STDIN_FILENO);
+        return std.posix.execvpeZ("less", &.{"less"}, @ptrCast(std.os.environ.ptr));
+    } else {
+        std.posix.close(read_pipe);
+        // we are the parent
+        const f: std.fs.File = .{ .handle = write_pipe };
+        try f.writeAll(text);
+        f.close();
+        return fork_pid;
+    }
+}
+
+const FetchedLyricsJson = struct {
+    id: u64,
+    trackName: []const u8,
+    artistName: []const u8,
+    albumName: []const u8,
+    plainLyrics: []const u8,
+};
+const FetchingState = struct {
+    done: bool,
+    fetched_lrc_id: ?u64,
+};
+fn fetchLyricsThreadFn(state: *FetchingState, arraylist: *std.ArrayList(u8), si: SongInfo, maybe_lrc_id: ?u64) void {
+    const arena = arraylist.allocator;
+    var client = std.http.Client{
+        .allocator = arena,
+    };
+
+    const path, const query = if (maybe_lrc_id) |lrc_id| blk: {
+        const path = std.fmt.allocPrint(arena, "/api/get/{d}", .{lrc_id}) catch @panic("welp");
+        break :blk .{ path, "" };
+    } else blk: {
+        const query = switch (si.album == null) {
+            true => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}&album_name={s}", .{ si.title, si.artist, si.album.? }) catch @panic("welp"),
+            false => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}", .{ si.title, si.artist }) catch @panic("welp"),
+        };
+        break :blk .{ "/api/search", query };
+    };
+
+
+    const uri: std.Uri = .{
+        .scheme = "https",
+        .host = .{ .percent_encoded = "lrclib.net" },
+        .path = .{ .percent_encoded = path },
+        .query = .{ .raw = query },
+    };
+    const res = client.fetch(.{
+        .response_storage = .{
+            .dynamic = arraylist,
+        },
+        .location = .{
+            .uri = uri,
+        },
+    }) catch @panic("welp");
+    if (res.status != .ok) std.debug.panic("{}", .{res.status});
+
+    if (maybe_lrc_id == null) {
+        const fetched = std.json.parseFromSliceLeaky([]FetchedLyricsJson, arena, arraylist.items, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch @panic("welp");
+
+        const song = fetched[0];
+
+        arraylist.clearRetainingCapacity();
+        arraylist.appendSlice(song.plainLyrics) catch @panic("welp");
+
+        state.fetched_lrc_id = song.id;
+    } else {
+        const song = std.json.parseFromSliceLeaky(FetchedLyricsJson, arena, arraylist.items, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch @panic("welp");
+        arraylist.clearRetainingCapacity();
+        arraylist.appendSlice(song.plainLyrics) catch @panic("welp");
+        state.fetched_lrc_id = null;
+    }
+    @atomicStore(bool, &state.done, true, .monotonic);
 }
 
 const Action = enum {
