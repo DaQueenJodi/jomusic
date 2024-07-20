@@ -1023,8 +1023,8 @@ fn extractMsTimeFromSynchronizedLyricLine(line: []const u8) u64 {
     const secs = std.fmt.parseInt(u32, secs_str, 10) catch unreachable;
     const hundreths = std.fmt.parseInt(u32, hundreths_str, 10) catch unreachable;
     return (hundreths * (std.time.ms_per_s) / 100) +
-(secs * std.time.ms_per_s) +
-(mins * std.time.ms_per_min);
+        (secs * std.time.ms_per_s) +
+        (mins * std.time.ms_per_min);
 }
 
 const Action = enum {
