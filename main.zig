@@ -49,6 +49,13 @@ pub fn main() !void {
 
             var in_background = false;
             var fetching_lyrics = false;
+
+            var displaying_synced_lyrics = false;
+            // all three are only valid when `displaying_synced_lyrics` is true
+            var synced_lyrics_iterator: std.mem.SplitIterator(u8, .scalar) = undefined;
+            var synced_lyric_to_display: []const u8 = undefined;
+            var ms_of_next_lyric: ?u64 = undefined;
+
             var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song } = .normal;
             var curr_song_idx: u32 = 0;
 
@@ -59,19 +66,26 @@ pub fn main() !void {
             var running_process_id: std.posix.pid_t = undefined;
 
             // should only be accessed by the lyric fetching thread or when it's done working
-            var lyric_thread_arena_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            const lyric_thread_arena = lyric_thread_arena_impl.allocator();
-            var fetched_lyrics = std.ArrayList(u8).init(lyric_thread_arena);
+            var fetching_arena_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            const fetching_arena = fetching_arena_impl.allocator();
             // only valid while `fetching_lyrics` is true
-            var lyrics_fetching_thread_state: FetchingState = undefined;
+            var fetching_state: FetchingState = undefined;
             //  actually play the queue
             outer: while (true) {
                 switch (state) {
                     .exit => {
+                        if (displaying_synced_lyrics) {
+                            displaying_synced_lyrics = false;
+                            allocator.free(synced_lyrics_iterator.buffer);
+                        }
                         stdout.writeAll("\x1B[2K\x1B[1G(exitted)\n") catch {};
                         break;
                     },
                     .next_song => {
+                        if (displaying_synced_lyrics) {
+                            displaying_synced_lyrics = false;
+                            allocator.free(synced_lyrics_iterator.buffer);
+                        }
                         curr_song_idx += 1;
                         state = .normal;
                         stdout.writeAll("\x1B[2K\x1B[1G(skipped)\n") catch {};
@@ -118,7 +132,7 @@ pub fn main() !void {
                         const pulse_stream = initPulse(@intCast(channels), sample_rate);
                         defer c.pa_simple_free(pulse_stream);
 
-                        var i: u32 = 0;
+                        var i: usize = 0;
                         inner: while (true) {
                             const input = if (in_background or fetching_lyrics) 0 else readByteOrZero(stdin);
                             switch (input) {
@@ -149,19 +163,31 @@ pub fn main() !void {
                                     in_background = true;
                                 },
                                 // lyrics
-                                'l' => {
+                                // 'l' => full page lyrics
+                                // 'L' => synchronized lyrics
+                                inline 'l', 'L' => |l_flavor| {
                                     fetching_lyrics = true;
-                                    lyrics_fetching_thread_state.done = false;
+                                    displaying_synced_lyrics = l_flavor == 'L';
+                                    fetching_state = .{
+                                        .done = false,
+                                        .fetched_lrc_id = null,
+                                        .fetched = std.ArrayList(u8).init(fetching_arena),
+                                    };
 
                                     var diags: sql.Diagnostics = .{};
-                                    const maybe_lrc_id = db.one(u64, "SELECT lrc_id FROM lyrics WHERE song_id=?", .{ .diags = &diags }, .{id}) catch |err| {
+                                    const maybe_lrc_id = db.one(
+                                        u64,
+                                        "SELECT lrc_id FROM lyrics WHERE song_id=?",
+                                        .{ .diags = &diags },
+                                        .{id},
+                                    ) catch |err| {
                                         die("failed to get lyrics from lyrics database: {s}: {}", .{ @errorName(err), diags });
                                     };
 
                                     const t = std.Thread.spawn(
                                         .{},
                                         fetchLyricsThreadFn,
-                                        .{ &lyrics_fetching_thread_state, &fetched_lyrics, song.info, maybe_lrc_id },
+                                        .{ &fetching_state, song.info, maybe_lrc_id, l_flavor == 'L' },
                                     ) catch |err| {
                                         die("failed to fetch lyrics: {s}", .{@errorName(err)});
                                     };
@@ -177,13 +203,27 @@ pub fn main() !void {
                                 else => {},
                             }
 
-                            if (!fetching_lyrics and !in_background and i % sample_rate == 0) {
+                            if (!fetching_lyrics and !in_background and i % 100 == 0) {
                                 // clear line
                                 stdout.writeAll("\x1B[2K\x1B[1G") catch {};
-                                stdout.print("{}/{}", .{
-                                    fmtSecs(@divFloor(i, sample_rate)),
-                                    fmtSecs(length_in_secs),
-                                }) catch {};
+                                if (displaying_synced_lyrics) {
+                                    stdout.writeAll(synced_lyric_to_display) catch {};
+                                    if (ms_of_next_lyric) |target_ms| {
+                                        const milis = @divFloor(i * 1000, sample_rate);
+                                        if (milis >= target_ms + 100) {
+                                            synced_lyric_to_display = synced_lyrics_iterator.next().?;
+                                            ms_of_next_lyric = ms: {
+                                                const next = synced_lyrics_iterator.peek() orelse break :ms null;
+                                                break :ms extractMsTimeFromSynchronizedLyricLine(next);
+                                            };
+                                        }
+                                    }
+                                } else {
+                                    stdout.print("{}/{}", .{
+                                        fmtSecs(@divFloor(i, sample_rate)),
+                                        fmtSecs(length_in_secs),
+                                    }) catch {};
+                                }
                             }
                             if (state != .paused) {
                                 if (song.readNextFrame()) |frame| {
@@ -206,11 +246,9 @@ pub fn main() !void {
                             // poll if thread is done fetching
                             // if it is, start the pager process
                             if (fetching_lyrics) {
-                                const done = @atomicLoad(bool, &lyrics_fetching_thread_state.done, .monotonic);
+                                const done = @atomicLoad(bool, &fetching_state.done, .monotonic);
                                 if (done) {
-                                    fetching_lyrics = false;
-
-                                    if (lyrics_fetching_thread_state.fetched_lrc_id) |lrc_id| {
+                                    if (fetching_state.fetched_lrc_id) |lrc_id| {
                                         var diags: sql.Diagnostics = .{};
                                         db.exec(
                                             "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
@@ -221,13 +259,23 @@ pub fn main() !void {
                                         };
                                     }
 
-                                    lyrics_fetching_thread_state = undefined;
+                                    if (displaying_synced_lyrics) {
+                                        const str = try allocator.dupe(u8, fetching_state.fetched.items);
+                                        synced_lyrics_iterator = std.mem.splitScalar(u8, str, '\n');
+                                        synced_lyric_to_display = synced_lyrics_iterator.first();
+                                        ms_of_next_lyric = ms: {
+                                            const next = synced_lyrics_iterator.peek() orelse break :ms null;
+                                            break :ms extractMsTimeFromSynchronizedLyricLine(next);
+                                        };
+                                    } else {
+                                        const pid = try spawnPagerWithLyrics(fetching_state.fetched.items);
+                                        running_process_id = pid;
+                                        in_background = true;
+                                    }
 
-                                    const pid = try spawnPagerWithLyrics(fetched_lyrics.items);
-                                    defer fetched_lyrics.clearRetainingCapacity();
-
-                                    running_process_id = pid;
-                                    in_background = true;
+                                    fetching_state = undefined;
+                                    fetching_lyrics = false;
+                                    _ = fetching_arena_impl.reset(.free_all);
                                 }
                             }
                         }
@@ -881,19 +929,13 @@ fn spawnPagerWithLyrics(text: []const u8) !std.posix.pid_t {
     }
 }
 
-const FetchedLyricsJson = struct {
-    id: u64,
-    trackName: []const u8,
-    artistName: []const u8,
-    albumName: []const u8,
-    plainLyrics: []const u8,
-};
 const FetchingState = struct {
     done: bool,
     fetched_lrc_id: ?u64,
+    fetched: std.ArrayList(u8),
 };
-fn fetchLyricsThreadFn(state: *FetchingState, arraylist: *std.ArrayList(u8), si: SongInfo, maybe_lrc_id: ?u64) void {
-    const arena = arraylist.allocator;
+fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, comptime synced_lyrics: bool) void {
+    const arena = state.fetched.allocator;
     var client = std.http.Client{
         .allocator = arena,
     };
@@ -909,7 +951,6 @@ fn fetchLyricsThreadFn(state: *FetchingState, arraylist: *std.ArrayList(u8), si:
         break :blk .{ "/api/search", query };
     };
 
-
     const uri: std.Uri = .{
         .scheme = "https",
         .host = .{ .percent_encoded = "lrclib.net" },
@@ -918,7 +959,7 @@ fn fetchLyricsThreadFn(state: *FetchingState, arraylist: *std.ArrayList(u8), si:
     };
     const res = client.fetch(.{
         .response_storage = .{
-            .dynamic = arraylist,
+            .dynamic = &state.fetched,
         },
         .location = .{
             .uri = uri,
@@ -927,27 +968,63 @@ fn fetchLyricsThreadFn(state: *FetchingState, arraylist: *std.ArrayList(u8), si:
     if (res.status != .ok) std.debug.panic("{}", .{res.status});
 
     if (maybe_lrc_id == null) {
-        const fetched = std.json.parseFromSliceLeaky([]FetchedLyricsJson, arena, arraylist.items, .{
+        const JsonT = switch (synced_lyrics) {
+            true => struct {
+                id: u64,
+                syncedLyrics: []const u8,
+            },
+            false => struct {
+                id: u64,
+                plainLyrics: []const u8,
+            },
+        };
+        const fetched = std.json.parseFromSliceLeaky([]JsonT, arena, state.fetched.items, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch @panic("welp");
 
         const song = fetched[0];
-
-        arraylist.clearRetainingCapacity();
-        arraylist.appendSlice(song.plainLyrics) catch @panic("welp");
+        const lyrics = if (comptime synced_lyrics) song.syncedLyrics else song.plainLyrics;
+        state.fetched.clearRetainingCapacity();
+        state.fetched.appendSlice(lyrics) catch @panic("welp");
 
         state.fetched_lrc_id = song.id;
     } else {
-        const song = std.json.parseFromSliceLeaky(FetchedLyricsJson, arena, arraylist.items, .{
+        const JsonT = switch (synced_lyrics) {
+            true => struct {
+                syncedLyrics: []const u8,
+            },
+            false => struct {
+                plainLyrics: []const u8,
+            },
+        };
+        const song = std.json.parseFromSliceLeaky(JsonT, arena, state.fetched.items, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch @panic("welp");
-        arraylist.clearRetainingCapacity();
-        arraylist.appendSlice(song.plainLyrics) catch @panic("welp");
+        const lyrics = if (comptime synced_lyrics) song.syncedLyrics else song.plainLyrics;
+        state.fetched.clearRetainingCapacity();
+        state.fetched.appendSlice(lyrics) catch @panic("welp");
         state.fetched_lrc_id = null;
     }
     @atomicStore(bool, &state.done, true, .monotonic);
+}
+
+fn extractMsTimeFromSynchronizedLyricLine(line: []const u8) u64 {
+    const rbracket_idx = "[00:00.00".len;
+    const time_str = line[1..rbracket_idx];
+
+    var place_iter = std.mem.window(u8, time_str, 2, 3);
+    const mins_str = place_iter.next().?;
+    const secs_str = place_iter.next().?;
+    const hundreths_str = place_iter.next().?;
+
+    const mins = std.fmt.parseInt(u32, mins_str, 10) catch unreachable;
+    const secs = std.fmt.parseInt(u32, secs_str, 10) catch unreachable;
+    const hundreths = std.fmt.parseInt(u32, hundreths_str, 10) catch unreachable;
+    return (hundreths * (std.time.ms_per_s) / 100) +
+(secs * std.time.ms_per_s) +
+(mins * std.time.ms_per_min);
 }
 
 const Action = enum {
