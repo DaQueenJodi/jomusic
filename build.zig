@@ -1,10 +1,7 @@
 pub fn build(b: *std.Build) void {
-
-    const should_install = b.option(bool, "install", "") orelse false;
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const llvm = b.option(bool, "llvm", "") orelse true;
+    const llvm = b.option(bool, "llvm", "") orelse false;
     const exe = b.addExecutable(.{
         .name = "jomusic",
         .root_source_file = b.path("main.zig"),
@@ -13,11 +10,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = llvm,
         .use_lld = llvm,
     });
-    if (should_install) {
-        b.installArtifact(exe);
-    } else {
-        b.getInstallStep().dependOn(&exe.step);
-    }
+    b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);
