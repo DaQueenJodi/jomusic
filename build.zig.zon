@@ -30,6 +30,10 @@
             .url = "git+https://github.com/vrischmann/zig-sqlite?ref=master#e4afe26b30e03ee5d8b61946893b19c2585745f8",
             .hash = "122019ea6e071dbd932c3e51d9631d99f007240e3e08d5436a1da20ad088343ca4a7",
         },
+        .zg = .{
+            .url = "git+https://codeberg.org/dude_the_builder/zg?ref=master#7ddce488e074c3f052949ba513a340446cea86e9",
+            .hash = "12205e2e7108385a1ec280b6365166e902a690d6a0e8fcc015fdea62d63cf79be8ec",
+        },
     },
     .paths = .{
         "build.zig",

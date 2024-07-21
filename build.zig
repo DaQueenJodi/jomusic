@@ -1,7 +1,7 @@
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const llvm = b.option(bool, "llvm", "") orelse false;
+    const llvm = b.option(bool, "llvm", "") orelse true;
     const exe = b.addExecutable(.{
         .name = "jomusic",
         .root_source_file = b.path("main.zig"),
@@ -34,6 +34,9 @@ pub fn build(b: *std.Build) void {
     const sqlite_dep = b.dependency("sqlite", .{});
     exe.root_module.addImport("sqlite", sqlite_dep.module("sqlite"));
     exe.linkLibrary(sqlite_dep.artifact("sqlite"));
+
+    const zg_dep = b.dependency("zg", .{});
+    exe.root_module.addImport("zg-grapheme", zg_dep.module("grapheme"));
 
     const docs_path = exe.getEmittedDocs();
     const serve_docs = b.addSystemCommand(&.{ "python", "-m", "http.server", "-d" });
