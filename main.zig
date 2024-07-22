@@ -207,6 +207,7 @@ pub fn main() !void {
                                         .done = false,
                                         .fetched_lrc_id = null,
                                         .fetched = std.ArrayList(u8).init(fetching_arena),
+                                        .result = undefined,
                                     };
 
                                     var diags: sql.Diagnostics = .{};
@@ -1131,20 +1132,32 @@ const FetchingState = struct {
     done: bool,
     fetched_lrc_id: ?u64,
     fetched: std.ArrayList(u8),
+    result: enum { success, OOM, couldnt_fetch, couldnt_parse_json },
 };
 fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, comptime synced_lyrics: bool) void {
+    defer @atomicStore(bool, &state.done, true, .monotonic);
+
     const arena = state.fetched.allocator;
     var client = std.http.Client{
         .allocator = arena,
     };
 
     const path, const query = if (maybe_lrc_id) |lrc_id| blk: {
-        const path = std.fmt.allocPrint(arena, "/api/get/{d}", .{lrc_id}) catch @panic("welp");
+        const path = std.fmt.allocPrint(arena, "/api/get/{d}", .{lrc_id}) catch {
+            state.result = .OOM;
+            return;
+        };
         break :blk .{ path, "" };
     } else blk: {
         const query = switch (si.album != null) {
-            true => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}&album_name={s}", .{ si.title, si.artist, si.album.? }) catch @panic("welp"),
-            false => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}", .{ si.title, si.artist }) catch @panic("welp"),
+            true => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}&album_name={s}", .{ si.title, si.artist, si.album.? }) catch {
+                state.result = .OOM;
+                return;
+            },
+            false => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}", .{ si.title, si.artist }) catch {
+                state.result = .OOM;
+                return;
+            },
         };
         break :blk .{ "/api/search", query };
     };
@@ -1163,8 +1176,14 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
         .location = .{
             .uri = uri,
         },
-    }) catch @panic("welp");
-    if (res.status != .ok) std.debug.panic("{}", .{res.status});
+    }) catch {
+        state.result = .couldnt_fetch;
+        return;
+    };
+    if (res.status != .ok) {
+        state.result = .couldnt_fetch;
+        return;
+    }
 
     if (maybe_lrc_id == null) {
         const JsonT = switch (synced_lyrics) {
@@ -1181,12 +1200,22 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
         const fetched = std.json.parseFromSliceLeaky([]JsonT, arena, state.fetched.items, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
-        }) catch @panic("welp");
+        }) catch |err| {
+            state.result = switch (err) {
+                error.OutOfMemory => .OOM,
+                error.UnknownField, error.MissingField => .couldnt_fetch,
+                else => .couldnt_parse_json,
+            };
+            return;
+        };
 
         const song = fetched[0];
         const lyrics = if (synced_lyrics and song.syncedLyrics != null) song.syncedLyrics.? else song.plainLyrics;
         state.fetched.clearRetainingCapacity();
-        state.fetched.appendSlice(lyrics) catch @panic("welp");
+        state.fetched.appendSlice(lyrics) catch {
+            state.result = .OOM;
+            return;
+        };
 
         state.fetched_lrc_id = song.id;
     } else {
@@ -1202,13 +1231,22 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
         const song = std.json.parseFromSliceLeaky(JsonT, arena, state.fetched.items, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
-        }) catch @panic("welp");
+        }) catch |err| {
+            state.result = switch (err) {
+                error.OutOfMemory => .OOM,
+                error.UnknownField, error.MissingField => .couldnt_fetch,
+                else => .couldnt_parse_json,
+            };
+            return;
+        };
         const lyrics = if (synced_lyrics and song.syncedLyrics != null) song.syncedLyrics.? else song.plainLyrics;
         state.fetched.clearRetainingCapacity();
-        state.fetched.appendSlice(lyrics) catch @panic("welp");
+        state.fetched.appendSlice(lyrics) catch {
+            state.result = .OOM;
+            return;
+        };
         state.fetched_lrc_id = null;
     }
-    @atomicStore(bool, &state.done, true, .monotonic);
 }
 
 fn extractMsTimeFromSynchronizedLyricLine(line: []const u8) u64 {
