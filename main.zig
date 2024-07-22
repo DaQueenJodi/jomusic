@@ -1142,7 +1142,7 @@ inline fn die(comptime fmt: []const u8, args: anytype) noreturn {
     }
 }
 
-const MAX_SONG_COLUMN_LEN = 25;
+const MAX_SONG_COLUMN_LEN = 35;
 const ELLIPSIS = "...";
 
 // same as std.os.linux but status is allowed to be NULL
