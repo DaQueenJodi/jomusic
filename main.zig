@@ -338,34 +338,47 @@ pub fn main() !void {
                             if (fetching_lyrics) {
                                 const done = @atomicLoad(bool, &fetching_state.done, .monotonic);
                                 if (done) {
-                                    if (fetching_state.fetched_lrc_id) |lrc_id| {
-                                        var diags: sql.Diagnostics = .{};
-                                        db.exec(
-                                            "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
-                                            .{ .diags = &diags },
-                                            .{ song_id, lrc_id },
-                                        ) catch |err| {
-                                            die("failed to insert lyrics into table: {s}: {}", .{ @errorName(err), diags });
-                                        };
+                                    switch (fetching_state.result) {
+                                        .out_of_memory => return error.OutOfMemory,
+                                        .fell_back_to_plain_lyrics => {
+                                            assert(displaying_synced_lyrics);
+                                            // todo handle this more gracefully with user input maybe
+                                            displaying_synced_lyrics = false;
+                                        },
+                                        inline .couldnt_parse_json, .couldnt_fetch, .unexpected_status_code, .song_not_found, .success, => |res| {
+                                            const success = res == .success;
+                                            if (success) {
+                                                if (fetching_state.fetched_lrc_id) |lrc_id| {
+                                                    var diags: sql.Diagnostics = .{};
+                                                    db.exec(
+                                                    "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
+                                                    .{ .diags = &diags },
+                                                    .{ song_id, lrc_id },
+                                                ) catch |err| {
+                                                        die("failed to insert lyrics into table: {s}: {}", .{ @errorName(err), diags });
+                                                    };
+                                                }
+                                            }
+
+                                            const buf = switch (success) {
+                                                true => fetching_state.fetched.items,
+                                                false => std.fmt.comptimePrint("failed to fetch lyrics: {s}", .{@tagName(res)}),
+                                            };
+                                            if (displaying_synced_lyrics) {
+                                                const duped = try allocator.dupe(u8, buf);
+                                                synced_lyrics = SyncedLyrics.init(duped);
+                                            } else {
+                                                const pid = try spawnPagerWithLyrics(buf);
+                                                running_process_id = pid;
+                                                in_background = .pager;
+                                            }
+
+                                            fetching_state = undefined;
+                                            fetching_lyrics = false;
+                                            _ = fetching_arena_impl.reset(.free_all);
+                                        },
                                     }
 
-                                    if (displaying_synced_lyrics) {
-                                        const str = try allocator.dupe(u8, fetching_state.fetched.items);
-                                        synced_lyrics_iterator = std.mem.splitScalar(u8, str, '\n');
-                                        synced_lyric_to_display = synced_lyrics_iterator.first();
-                                        ms_of_next_lyric = ms: {
-                                            const next = synced_lyrics_iterator.peek() orelse break :ms null;
-                                            break :ms extractMsTimeFromSynchronizedLyricLine(next);
-                                        };
-                                    } else {
-                                        const pid = try spawnPagerWithLyrics(fetching_state.fetched.items);
-                                        running_process_id = pid;
-                                        in_background = .pager;
-                                    }
-
-                                    fetching_state = undefined;
-                                    fetching_lyrics = false;
-                                    _ = fetching_arena_impl.reset(.free_all);
                                 }
                             }
                         }
@@ -1193,7 +1206,7 @@ const FetchingState = struct {
     done: bool,
     fetched_lrc_id: ?u64,
     fetched: std.ArrayList(u8),
-    result: enum { success, OOM, couldnt_fetch, couldnt_parse_json },
+    result: enum { success, out_of_memory, couldnt_fetch, song_not_found, couldnt_parse_json, fell_back_to_plain_lyrics, unexpected_status_code },
 };
 fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, comptime synced_lyrics: bool) void {
     defer @atomicStore(bool, &state.done, true, .monotonic);
@@ -1205,18 +1218,18 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
 
     const path, const query = if (maybe_lrc_id) |lrc_id| blk: {
         const path = std.fmt.allocPrint(arena, "/api/get/{d}", .{lrc_id}) catch {
-            state.result = .OOM;
+            state.result = .out_of_memory;
             return;
         };
         break :blk .{ path, "" };
     } else blk: {
         const query = switch (si.album != null) {
             true => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}&album_name={s}", .{ si.title, si.artist, si.album.? }) catch {
-                state.result = .OOM;
+                state.result = .out_of_memory;
                 return;
             },
             false => std.fmt.allocPrint(arena, "track_name={s}&artist_name={s}", .{ si.title, si.artist }) catch {
-                state.result = .OOM;
+                state.result = .out_of_memory;
                 return;
             },
         };
@@ -1237,13 +1250,24 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
         .location = .{
             .uri = uri,
         },
+        .headers = .{
+            // as encouraged by https://lrclib.net/docs
+            .user_agent = .{ .override = "jomusic 0.1.0 (https://github.com/daqueenjodi/jomusic" },
+        },
     }) catch {
         state.result = .couldnt_fetch;
         return;
     };
-    if (res.status != .ok) {
-        state.result = .couldnt_fetch;
-        return;
+    switch (res.status) {
+        .ok => {},
+        .not_found => {
+            state.result = .song_not_found;
+            return;
+        },
+        else => {
+            state.result = .unexpected_status_code;
+            return;
+        },
     }
 
     if (maybe_lrc_id == null) {
@@ -1263,18 +1287,26 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             .allocate = .alloc_always,
         }) catch |err| {
             state.result = switch (err) {
-                error.OutOfMemory => .OOM,
-                error.UnknownField, error.MissingField => .couldnt_fetch,
+                error.OutOfMemory => .out_of_memory,
+                error.UnknownField => unreachable,
+                error.MissingField => .couldnt_fetch,
                 else => .couldnt_parse_json,
             };
             return;
         };
 
         const song = fetched[0];
-        const lyrics = if (synced_lyrics and song.syncedLyrics != null) song.syncedLyrics.? else song.plainLyrics;
+        const lyrics = blk: {
+            if (synced_lyrics) {
+                break :blk song.syncedLyrics orelse {
+                    state.result = .fell_back_to_plain_lyrics;
+                    break :blk song.plainLyrics;
+                };
+            } else break :blk song.plainLyrics;
+        };
         state.fetched.clearRetainingCapacity();
         state.fetched.appendSlice(lyrics) catch {
-            state.result = .OOM;
+            state.result = .out_of_memory;
             return;
         };
 
@@ -1294,37 +1326,30 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             .allocate = .alloc_always,
         }) catch |err| {
             state.result = switch (err) {
-                error.OutOfMemory => .OOM,
-                error.UnknownField, error.MissingField => .couldnt_fetch,
+                error.OutOfMemory => .out_of_memory,
+                error.UnknownField => unreachable,
+                error.MissingField => .couldnt_fetch,
                 else => .couldnt_parse_json,
             };
             return;
         };
-        const lyrics = if (synced_lyrics and song.syncedLyrics != null) song.syncedLyrics.? else song.plainLyrics;
+        const lyrics = blk: {
+            if (synced_lyrics) {
+                break :blk song.syncedLyrics orelse {
+                    state.result = .fell_back_to_plain_lyrics;
+                    break :blk song.plainLyrics;
+                };
+            } else break :blk song.plainLyrics;
+        };
         state.fetched.clearRetainingCapacity();
         state.fetched.appendSlice(lyrics) catch {
-            state.result = .OOM;
+            state.result = .out_of_memory;
             return;
         };
         state.fetched_lrc_id = null;
     }
-}
 
-fn extractMsTimeFromSynchronizedLyricLine(line: []const u8) u64 {
-    const rbracket_idx = "[00:00.00".len;
-    const time_str = line[1..rbracket_idx];
-
-    var place_iter = std.mem.window(u8, time_str, 2, 3);
-    const mins_str = place_iter.next().?;
-    const secs_str = place_iter.next().?;
-    const hundreths_str = place_iter.next().?;
-
-    const mins = std.fmt.parseInt(u32, mins_str, 10) catch unreachable;
-    const secs = std.fmt.parseInt(u32, secs_str, 10) catch unreachable;
-    const hundreths = std.fmt.parseInt(u32, hundreths_str, 10) catch unreachable;
-    return (hundreths * (std.time.ms_per_s) / 100) +
-        (secs * std.time.ms_per_s) +
-        (mins * std.time.ms_per_min);
+    state.result = .success;
 }
 
 const Action = enum {
