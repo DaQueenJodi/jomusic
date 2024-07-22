@@ -54,7 +54,6 @@ pub fn main() !void {
             // only valid when `displaying_synced_lyrics` is true
             var synced_lyrics: SyncedLyrics = undefined;
 
-
             var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song, wants_to_reload } = .normal;
             var curr_song_idx: u32 = 0;
 
@@ -72,7 +71,8 @@ pub fn main() !void {
             //  actually play the queue
             outer: while (true) {
                 switch (state) {
-                    .paused, => unreachable,
+                    .paused,
+                    => unreachable,
                     .wants_to_reload => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
@@ -213,7 +213,6 @@ pub fn main() !void {
                                         };
                                     }
 
-
                                     const others_file = std.fs.createFileAbsolute("/tmp/jomusic_others", .{}) catch |err| {
                                         die("failed to open jomusic others file: {s}", .{@errorName(err)});
                                     };
@@ -234,7 +233,7 @@ pub fn main() !void {
                                     while (iter.nextAlloc(arena, .{ .diags = &diags }) catch |err| {
                                         die("failed to iterate songs table: {s}: {}", .{ @errorName(err), diags });
                                     }) |curr_song| {
-                                        others_writer.print("{d} #'{s}' by '{s}'", .{curr_song.id, curr_song.title, curr_song.artist}) catch |err| {
+                                        others_writer.print("{d} #'{s}' by '{s}'", .{ curr_song.id, curr_song.title, curr_song.artist }) catch |err| {
                                             die("failed to set up others file: {s}", .{@errorName(err)});
                                         };
                                         if (curr_song.album) |album| others_writer.print(" from '{s}'", .{album}) catch |err| {
@@ -245,22 +244,23 @@ pub fn main() !void {
                                         };
                                     }
 
-
                                     const pid = std.posix.fork() catch |err| {
                                         die("failed to spawn nvim process: fork: {s}", .{@errorName(err)});
                                     };
 
                                     if (pid == 0) {
                                         // we are the child
-                                        const err = std.posix.execvpeZ("nvim", &.{"nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others"}, @ptrCast(std.os.environ),);
+                                        const err = std.posix.execvpeZ(
+                                            "nvim",
+                                            &.{ "nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others" },
+                                            @ptrCast(std.os.environ),
+                                        );
                                         die("failed to spawn nvim process: execvpeZ: {s}", .{@errorName(err)});
-                                        
                                     } else {
                                         // we are the parent
                                         running_process_id = pid;
                                         in_background = .queue;
                                     }
-
                                 },
                                 // clear screen
                                 CTRL('l') => {
@@ -359,7 +359,6 @@ pub fn main() !void {
                                                 die("failed to read jomusic_queue: {s}", .{@errorName(err)});
                                             };
 
-
                                             std.fs.deleteFileAbsolute("/tmp/jomusic_queue") catch |err| {
                                                 std.log.err("failed to delete jomusic queue file: {s}", .{@errorName(err)});
                                             };
@@ -396,7 +395,7 @@ pub fn main() !void {
                                                         song_id_changed = true;
                                                     }
                                                 } else {
-                                                   die("invalid attribute: {s}", .{maybe_current_marker});
+                                                    die("invalid attribute: {s}", .{maybe_current_marker});
                                                 }
                                             }
                                             if (!saw_c) {
@@ -428,16 +427,21 @@ pub fn main() !void {
                                             // todo handle this more gracefully with user input maybe
                                             displaying_synced_lyrics = false;
                                         },
-                                        inline .couldnt_parse_json, .couldnt_fetch, .unexpected_status_code, .song_not_found, .success, => |res| {
+                                        inline .couldnt_parse_json,
+                                        .couldnt_fetch,
+                                        .unexpected_status_code,
+                                        .song_not_found,
+                                        .success,
+                                        => |res| {
                                             const success = res == .success;
                                             if (success) {
                                                 if (fetching_state.fetched_lrc_id) |lrc_id| {
                                                     var diags: sql.Diagnostics = .{};
                                                     db.exec(
-                                                    "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
-                                                    .{ .diags = &diags },
-                                                    .{ song_id, lrc_id },
-                                                ) catch |err| {
+                                                        "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
+                                                        .{ .diags = &diags },
+                                                        .{ song_id, lrc_id },
+                                                    ) catch |err| {
                                                         die("failed to insert lyrics into table: {s}: {}", .{ @errorName(err), diags });
                                                     };
                                                 }
@@ -461,7 +465,6 @@ pub fn main() !void {
                                             _ = fetching_arena_impl.reset(.free_all);
                                         },
                                     }
-
                                 }
                             }
                         }
@@ -913,7 +916,7 @@ fn printTruncatedSongData(arena: Allocator, writer: anytype, comptime fmt: []con
             var buf: [MAX_SONG_COLUMN_LEN]u8 = undefined;
             const str = std.fmt.bufPrint(&buf, "{d}", .{data}) catch &buf;
             if (str.len > max) {
-                writer.writeAll(str[0..max - ELLIPSIS.len]) catch {};
+                writer.writeAll(str[0 .. max - ELLIPSIS.len]) catch {};
                 writer.writeAll(ELLIPSIS) catch {};
                 return max;
             }
@@ -1106,7 +1109,6 @@ fn getSongRowFromDb(db: *sql.Db, allocator: Allocator, id: u64) ?SongRow {
         die("failed to retrieve song row from database: {s}: {}", .{ @errorName(err), diags });
     };
 }
-
 
 inline fn fmtSecs(secs: u64) FmtSecs {
     return .{ .secs = secs };

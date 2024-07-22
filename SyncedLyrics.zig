@@ -4,7 +4,6 @@ iter: std.mem.SplitIterator(u8, .scalar),
 
 const SyncedLyrics = @This();
 
-
 const NEXT_TIME_SENTINEL = std.math.maxInt(u64);
 
 pub fn init(buf: []const u8) SyncedLyrics {
