@@ -55,7 +55,7 @@ pub fn main() !void {
             var synced_lyrics: SyncedLyrics = undefined;
 
 
-            var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song } = .normal;
+            var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song, wants_to_reload } = .normal;
             var curr_song_idx: u32 = 0;
 
             const stdout = std.io.getStdOut().writer();
@@ -72,6 +72,15 @@ pub fn main() !void {
             //  actually play the queue
             outer: while (true) {
                 switch (state) {
+                    .paused, => unreachable,
+                    .wants_to_reload => {
+                        if (displaying_synced_lyrics) {
+                            displaying_synced_lyrics = false;
+                            allocator.free(synced_lyrics.iter.buffer);
+                        }
+                        stdout.writeAll("\x1B[2K\x1B[1G(switched songs)\n") catch {};
+                        state = .normal;
+                    },
                     .exit => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
@@ -99,7 +108,6 @@ pub fn main() !void {
                         state = .normal;
                         stdout.writeAll("\x1B[2K\x1B[1G(skipped)\n") catch {};
                     },
-                    .paused => unreachable,
                     .normal => {
                         const song_id = queue.items[curr_song_idx];
                         const song = PlayableSong.initFromDB(&db, allocator, song_id) catch |err| switch (err) {
@@ -185,7 +193,7 @@ pub fn main() !void {
                                     const arena = arena_impl.allocator();
 
                                     const queue_file = std.fs.createFileAbsolute("/tmp/jomusic_queue", .{}) catch |err| {
-                                        die("failed to open jomusic upcoming file: {s}", .{@errorName(err)});
+                                        die("failed to open jomusic queue file: {s}", .{@errorName(err)});
                                     };
                                     defer queue_file.close();
 
@@ -205,7 +213,39 @@ pub fn main() !void {
                                         };
                                     }
 
-                                    var child = std.process.Child.init(&.{ "nvim", "/tmp/jomusic_queue" }, arena);
+
+                                    const others_file = std.fs.createFileAbsolute("/tmp/jomusic_others", .{}) catch |err| {
+                                        die("failed to open jomusic others file: {s}", .{@errorName(err)});
+                                    };
+                                    defer others_file.close();
+
+                                    const others_writer = others_file.writer();
+
+                                    const all_songs_query = "SELECT id, title, artist, album FROM songs";
+                                    var stmt = db.prepare(all_songs_query) catch |err| {
+                                        die("failed to get list of songs from the database: {s}", .{@errorName(err)});
+                                    };
+                                    const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8 };
+                                    var diags: sql.Diagnostics = .{};
+                                    var iter = stmt.iterator(T, .{}) catch |err| {
+                                        die("failed to create song iterator: {s}", .{@errorName(err)});
+                                    };
+
+                                    while (iter.nextAlloc(arena, .{ .diags = &diags }) catch |err| {
+                                        die("failed to iterate songs table: {s}: {}", .{ @errorName(err), diags });
+                                    }) |curr_song| {
+                                        others_writer.print("{d} #'{s}' by '{s}'", .{curr_song.id, curr_song.title, curr_song.artist}) catch |err| {
+                                            die("failed to set up others file: {s}", .{@errorName(err)});
+                                        };
+                                        if (curr_song.album) |album| others_writer.print(" from '{s}'", .{album}) catch |err| {
+                                            die("failed to set up others file: {s}", .{@errorName(err)});
+                                        };
+                                        others_writer.writeByte('\n') catch |err| {
+                                            die("failed to set up others file: {s}", .{@errorName(err)});
+                                        };
+                                    }
+
+                                    var child = std.process.Child.init(&.{ "nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others" }, arena);
                                     child.spawn() catch |err| {
                                         die("failed to spawn nvim process: {s}", .{@errorName(err)});
                                     };
@@ -309,10 +349,25 @@ pub fn main() !void {
                                                 die("failed to read jomusic_queue: {s}", .{@errorName(err)});
                                             };
 
+
+                                            std.fs.deleteFileAbsolute("/tmp/jomusic_queue") catch |err| {
+                                                std.log.err("failed to delete jomusic queue file: {s}", .{@errorName(err)});
+                                            };
+                                            std.fs.deleteFileAbsolute("/tmp/jomusic_others") catch |err| {
+                                                std.log.err("failed to delete jomusic others file: {s}", .{@errorName(err)});
+                                            };
+
                                             queue.clearRetainingCapacity();
                                             var line_iter = std.mem.splitScalar(u8, buf, '\n');
+
+                                            var song_id_changed = false;
+                                            var saw_c = false;
                                             while (line_iter.next()) |line| {
-                                                var space_iter = std.mem.tokenizeScalar(u8, line, ' ');
+                                                const significant_line = ln: {
+                                                    const idx = std.mem.indexOfScalar(u8, line, '#') orelse line.len;
+                                                    break :ln line[0..idx];
+                                                };
+                                                var space_iter = std.mem.tokenizeScalar(u8, significant_line, ' ');
                                                 const id_str = space_iter.next() orelse continue;
                                                 const id = std.fmt.parseInt(u64, id_str, 10) catch {
                                                     die("expected ID to be a u64: got '{s}'", .{id_str});
@@ -320,10 +375,28 @@ pub fn main() !void {
                                                 try queue.append(id);
                                                 const maybe_current_marker = space_iter.next() orelse continue;
                                                 if (std.mem.eql(u8, maybe_current_marker, "c")) {
+                                                    if (saw_c) {
+                                                        die("expected exactly one line with the 'c' attribute!", .{});
+                                                    }
+                                                    saw_c = true;
                                                     curr_song_idx = @intCast(queue.items.len - 1);
+
+                                                    // if we switched the current song:
+                                                    if (song_id != id) {
+                                                        song_id_changed = true;
+                                                    }
                                                 } else {
-                                                    if (!std.mem.startsWith(u8, maybe_current_marker, "#")) die("invalid attribute: {s}", .{maybe_current_marker});
+                                                   die("invalid attribute: {s}", .{maybe_current_marker});
                                                 }
+                                            }
+                                            if (!saw_c) {
+                                                die("expected a line to have a 'c' attribute!", .{});
+                                            }
+                                            if (song_id_changed) {
+                                                in_background = .no;
+                                                running_process_id = undefined;
+                                                state = .wants_to_reload;
+                                                continue :outer;
                                             }
                                         },
                                         .pager => {},
@@ -1024,13 +1097,6 @@ fn getSongRowFromDb(db: *sql.Db, allocator: Allocator, id: u64) ?SongRow {
     };
 }
 
-const PlaySongExitStatus = enum {
-    user_wants_next_song,
-    user_wants_prev_song,
-    user_wants_to_quit,
-    user_wants_to_edit_queue,
-    done_playing_normally,
-};
 
 inline fn fmtSecs(secs: u64) FmtSecs {
     return .{ .secs = secs };
