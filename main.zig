@@ -51,10 +51,9 @@ pub fn main() !void {
             var fetching_lyrics = false;
 
             var displaying_synced_lyrics = false;
-            // all three are only valid when `displaying_synced_lyrics` is true
-            var synced_lyrics_iterator: std.mem.SplitIterator(u8, .scalar) = undefined;
-            var synced_lyric_to_display: []const u8 = undefined;
-            var ms_of_next_lyric: ?u64 = undefined;
+            // only valid when `displaying_synced_lyrics` is true
+            var synced_lyrics: SyncedLyrics = undefined;
+
 
             var state: enum { exit, paused, normal, next_song, next_song_normal, prev_song } = .normal;
             var curr_song_idx: u32 = 0;
@@ -76,7 +75,7 @@ pub fn main() !void {
                     .exit => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
-                            allocator.free(synced_lyrics_iterator.buffer);
+                            allocator.free(synced_lyrics.iter.buffer);
                         }
                         stdout.writeAll("\x1B[2K\x1B[1G(exitted)\n") catch {};
                         break;
@@ -84,7 +83,7 @@ pub fn main() !void {
                     .next_song => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
-                            allocator.free(synced_lyrics_iterator.buffer);
+                            allocator.free(synced_lyrics.iter.buffer);
                         }
                         curr_song_idx += 1;
                         state = .normal;
@@ -265,20 +264,15 @@ pub fn main() !void {
                                 else => {},
                             }
 
-                            if (!fetching_lyrics and in_background == .no and i % 100 == 0) {
+                            if (!fetching_lyrics and in_background == .no and i % 50 == 0) {
                                 // clear line
                                 stdout.writeAll("\x1B[2K\x1B[1G") catch {};
                                 if (displaying_synced_lyrics) {
-                                    stdout.writeAll(synced_lyric_to_display) catch {};
-                                    if (ms_of_next_lyric) |target_ms| {
-                                        const milis = @divFloor(i * 1000, sample_rate);
-                                        if (milis >= target_ms + 100) {
-                                            synced_lyric_to_display = synced_lyrics_iterator.next().?;
-                                            ms_of_next_lyric = ms: {
-                                                const next = synced_lyrics_iterator.peek() orelse break :ms null;
-                                                break :ms extractMsTimeFromSynchronizedLyricLine(next);
-                                            };
-                                        }
+                                    stdout.writeAll(synced_lyrics.curr_line) catch {};
+                                    const milis = @divFloor(i * 1000, sample_rate);
+                                    const target_ms = synced_lyrics.next_time_ms;
+                                    if (milis >= target_ms) {
+                                        synced_lyrics.getNextLine();
                                     }
                                 } else {
                                     stdout.print("{}/{}", .{
@@ -1356,5 +1350,6 @@ const sql = @import("sqlite");
 const grapheme = @import("zg-grapheme");
 const DisplayWidth = @import("zg-DisplayWidth");
 const c = @import("c.zig");
+const SyncedLyrics = @import("SyncedLyrics.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
