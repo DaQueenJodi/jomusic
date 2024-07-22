@@ -145,13 +145,39 @@ pub fn main() !void {
                                 },
                                 // previous
                                 'p' => {
-                                    state = .prev_song;
-                                    continue :outer;
+                                    // if we're within the first 2 seconds, we go back to the previous song
+                                    // otherwise, we'll just go to the beginning
+                                    if (@divFloor(i, sample_rate) > 2) {
+                                        i = 0;
+                                        if (c.drmp3_seek_to_pcm_frame(song.mp3, 0) == c.DRMP3_FALSE) {
+                                            die("failed to seek to the start of the song :/", .{});
+                                        }
+                                    } else {
+                                        state = .prev_song;
+                                        continue :outer;
+                                    }
                                 },
                                 // quit
                                 'e' => {
                                     state = .exit;
                                     continue :outer;
+                                },
+                                // seeking
+                                // left
+                                'k', 'a' => {
+                                    // seek back 5 seconds
+                                    i -|= (5 * sample_rate);
+                                    if (c.drmp3_seek_to_pcm_frame(song.mp3, i) == c.DRMP3_FALSE) {
+                                        die("failed to seek to :/", .{});
+                                    }
+                                },
+                                // right
+                                'j', 'd' => {
+                                    i += (5 * sample_rate);
+                                    i = @min(i, total_pcm_count);
+                                    if (c.drmp3_seek_to_pcm_frame(song.mp3, i) == c.DRMP3_FALSE) {
+                                        die("failed to seek to :/", .{});
+                                    }
                                 },
                                 // queue
                                 'q' => {
