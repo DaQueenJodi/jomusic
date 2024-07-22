@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
 
     const zg_dep = b.dependency("zg", .{});
     exe.root_module.addImport("zg-grapheme", zg_dep.module("grapheme"));
+    exe.root_module.addImport("zg-DisplayWidth", zg_dep.module("DisplayWidth"));
 
     const docs_path = exe.getEmittedDocs();
     const serve_docs = b.addSystemCommand(&.{ "python", "-m", "http.server", "-d" });

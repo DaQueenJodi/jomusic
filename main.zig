@@ -433,7 +433,7 @@ pub fn main() !void {
             defer stmt.deinit();
 
             const arg = args_iter.next() orelse {
-                printSongTable(arena, &stmt);
+                try printSongTable(arena, &stmt);
                 return;
             };
             if (std.mem.eql(u8, arg, "--fmt")) {
@@ -657,18 +657,23 @@ fn haveUserFillInMissingFields(arena: Allocator, found_metadata: MusicFileMetada
     return si;
 }
 
-fn printSongTable(arena: Allocator, mut_stmt: anytype) void {
+fn printSongTable(allocator: Allocator, mut_stmt: anytype) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
     var diags: sql.Diagnostics = .{};
     const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8, year: c_uint };
     const songs = mut_stmt.all(T, arena, .{ .diags = &diags }, .{}) catch |err| {
         die("failed to iterate songs: {s}: {}", .{ @errorName(err), diags });
     };
 
-    const max_id_len = calcColumnWidth(songs, "id");
-    const max_title_len = calcColumnWidth(songs, "title");
-    const max_album_len = calcColumnWidth(songs, "album");
-    const max_artist_len = calcColumnWidth(songs, "artist");
-    const max_year_len = calcColumnWidth(songs, "year");
+    const max_id_len = try calcColumnWidth(arena, songs, "id");
+    const max_title_len = try calcColumnWidth(arena, songs, "title");
+    const max_album_len = try calcColumnWidth(arena, songs, "album");
+    const max_artist_len = try calcColumnWidth(arena, songs, "artist");
+    const max_year_len = try calcColumnWidth(arena, songs, "year");
+    _ = arena_impl.reset(.retain_capacity);
 
     const stdout = std.io.getStdOut();
     var bw = std.io.bufferedWriter(stdout.writer());
@@ -735,11 +740,13 @@ fn printSongTable(arena: Allocator, mut_stmt: anytype) void {
                 break :blk data_raw orelse "null";
             } else data_raw;
 
-            const written = printTruncatedSongData(writer, fmt, data, column_len);
+            const written = try printTruncatedSongData(arena, writer, fmt, data, column_len);
             writer.writeByteNTimes(' ', column_len - written) catch {};
             writer.writeAll("│") catch {};
         }
         writer.writeByte('\n') catch {};
+
+        _ = arena_impl.reset(.retain_capacity);
     }
     // bottom of the table
     writer.writeAll("└") catch {};
@@ -784,32 +791,64 @@ const MusicFileMetadata = struct {
     }
 };
 
-fn printTruncatedSongData(writer: anytype, comptime fmt: []const u8, data: anytype, max: u8) u8 {
-    var buf: [MAX_SONG_COLUMN_LEN]u8 = undefined;
-    const str, const overflew = blk: {
-        const str = std.fmt.bufPrint(&buf, fmt, .{data}) catch |err| switch (err) {
-            error.NoSpaceLeft => break :blk .{ &buf, true },
-        };
-        break :blk .{ str, str.len > max };
-    };
-    if (overflew) {
-        assert(max > ELLIPSIS.len);
-        const truncated = str[0 .. max - ELLIPSIS.len];
-        const trimmed = std.mem.trimRight(u8, truncated, " ");
-        writer.writeAll(trimmed) catch {};
-        writer.writeAll(ELLIPSIS) catch {};
-        const written = trimmed.len + ELLIPSIS.len;
-        writer.writeByteNTimes(' ', max - written) catch {};
+fn printTruncatedSongData(arena: Allocator, writer: anytype, comptime fmt: []const u8, data: anytype, max: u8) !u8 {
+    switch (@TypeOf(data)) {
+        u64, c_uint => {
+            var buf: [MAX_SONG_COLUMN_LEN]u8 = undefined;
+            const str = std.fmt.bufPrint(&buf, "{d}", .{data}) catch &buf;
+            if (str.len > max) {
+                writer.writeAll(str[0..max - ELLIPSIS.len]) catch {};
+                writer.writeAll(ELLIPSIS) catch {};
+                return max;
+            }
+            writer.writeAll(str) catch {};
+            return @intCast(str.len);
+        },
+        ?[]const u8 => {
+            return try printTruncatedSongData(arena, writer, fmt, data.?, max);
+        },
+        []const u8 => {
+            const dwd = try DisplayWidth.DisplayWidthData.init(arena);
+            defer dwd.deinit();
 
-        std.log.err("truncated: '{s}', trimmed: '{s}', written: {d}, max: {d}", .{ truncated, trimmed, written, max });
-        return max;
-    } else {
-        writer.writeAll(str) catch {};
-        return @intCast(str.len);
+            const dw = DisplayWidth{ .data = &dwd };
+
+            const gd = try grapheme.GraphemeData.init(arena);
+            defer gd.deinit();
+
+            var grapheme_iter = grapheme.Iterator.init(data, &gd);
+
+            const full_width = dw.strWidth(data);
+            if (full_width <= max) {
+                writer.writeAll(data) catch {};
+                return @intCast(full_width);
+            }
+
+            var last_non_overflowing_non_whitespace_end: usize = 0;
+            var last_non_overflowing_non_whitespace_width: usize = 0;
+            while (grapheme_iter.next()) |gc| {
+                const full_off = gc.offset + gc.len;
+                const str = data[0..full_off];
+                const width = dw.strWidth(str);
+                if (width <= max - ELLIPSIS.len) {
+                    if (!std.mem.eql(u8, gc.bytes(str), " ")) {
+                        last_non_overflowing_non_whitespace_end = full_off;
+                        last_non_overflowing_non_whitespace_width = width;
+                    }
+                }
+                if (width > max) {
+                    break;
+                }
+            }
+            writer.writeAll(data[0..last_non_overflowing_non_whitespace_end]) catch {};
+            writer.writeAll(ELLIPSIS) catch {};
+            return @intCast(last_non_overflowing_non_whitespace_width + ELLIPSIS.len);
+        },
+        else => unreachable,
     }
 }
 
-fn calcColumnWidth(songs: anytype, comptime field: []const u8) u8 {
+fn calcColumnWidth(arena: Allocator, songs: anytype, comptime field: []const u8) !u8 {
     // the column needs to be at least as big as the name of the column
     var max: u8 = field.len;
     for (songs) |song| {
@@ -820,11 +859,13 @@ fn calcColumnWidth(songs: anytype, comptime field: []const u8) u8 {
             } else raw_data;
             switch (@TypeOf(data)) {
                 []const u8 => {
-                    if (data.len <= MAX_SONG_COLUMN_LEN) break :len @truncate(data.len);
-                    // printTruncatedSongData trims the data before adding the elipses, so we need to replicate that here to be accurate
-                    const trunc = data[0 .. MAX_SONG_COLUMN_LEN - ELLIPSIS.len];
-                    const trimmed = std.mem.trimRight(u8, trunc, " ");
-                    break :len @truncate(trimmed.len + ELLIPSIS.len);
+                    const dwd = try DisplayWidth.DisplayWidthData.init(arena);
+                    defer dwd.deinit();
+
+                    const dw = DisplayWidth{ .data = &dwd };
+
+                    const len = dw.strWidth(data);
+                    break :len @truncate(len);
                 },
                 u64, c_uint => break :len @truncate(std.fmt.count("{d}", .{data})),
                 else => unreachable,
@@ -1286,6 +1327,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tl = @import("taglib");
 const sql = @import("sqlite");
+const grapheme = @import("zg-grapheme");
+const DisplayWidth = @import("zg-DisplayWidth");
 const c = @import("c.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
