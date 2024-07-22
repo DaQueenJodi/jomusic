@@ -245,12 +245,22 @@ pub fn main() !void {
                                         };
                                     }
 
-                                    var child = std.process.Child.init(&.{ "nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others" }, arena);
-                                    child.spawn() catch |err| {
-                                        die("failed to spawn nvim process: {s}", .{@errorName(err)});
+
+                                    const pid = std.posix.fork() catch |err| {
+                                        die("failed to spawn nvim process: fork: {s}", .{@errorName(err)});
                                     };
-                                    running_process_id = child.id;
-                                    in_background = .queue;
+
+                                    if (pid == 0) {
+                                        // we are the child
+                                        const err = std.posix.execvpeZ("nvim", &.{"nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others"}, @ptrCast(std.os.environ),);
+                                        die("failed to spawn nvim process: execvpeZ: {s}", .{@errorName(err)});
+                                        
+                                    } else {
+                                        // we are the parent
+                                        running_process_id = pid;
+                                        in_background = .queue;
+                                    }
+
                                 },
                                 // clear screen
                                 CTRL('l') => {
