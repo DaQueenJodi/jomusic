@@ -1223,7 +1223,9 @@ fn printHelp(action: ?Action) noreturn {
         ) catch {},
         .list => stderr.writeAll(
             \\Usage:
-            \\  list        list songs in the database.
+            \\  list                list songs in the database in a fancy table.
+            \\  list --fmt <FMT>    list songs in the database with a custom format.
+            \\FMT: a format string in the form where each instance of "{COL}" is substituted with the COL column of the row.
             \\
         ) catch {},
         .remove => stderr.writeAll(
