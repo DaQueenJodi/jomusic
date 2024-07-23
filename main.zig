@@ -89,7 +89,7 @@ pub fn main() !void {
                             displaying_synced_lyrics = false;
                             gpa.free(synced_lyrics.iter.buffer);
                         }
-                        stdout.writeAll("\x1B[2K\x1B[1G(exitted)\n") catch {};
+                        stdout.writeAll("\x1B[2K\x1B[1G(exited)\n") catch {};
                         break;
                     },
                     .next_song => {
@@ -229,7 +229,7 @@ pub fn main() !void {
                                 },
                                 // lyrics
                                 // 'l' => full page lyrics
-                                // 'L' => inlined synchronized lyrics
+                                // 'L' => inline synchronized lyrics
                                 inline 'l', 'L' => |l_flavor| {
                                     fetching_lyrics = true;
                                     displaying_synced_lyrics = l_flavor == 'L';
@@ -291,7 +291,7 @@ pub fn main() !void {
                                         fmtSecs(length_in_secs),
                                     }) catch {};
                                     if (warning_to_display.len > 0) {
-                                        stdout.print(" \x1B[31m{s}\x1B[m (press any key to dimiss..)", .{warning_to_display.slice()}) catch {};
+                                        stdout.print(" \x1B[31m{s}\x1B[m (press any key to dismiss..)", .{warning_to_display.slice()}) catch {};
                                     }
                                 }
                             }
@@ -404,7 +404,7 @@ pub fn main() !void {
             }
         },
         .add => {
-            // we want to manage strings ourselves so we dont need to dupe anything
+            // we want to manage strings ourselves so we don't need to dupe anything
             tl.taglib_set_string_management_enabled(0);
 
             var arena_impl = std.heap.ArenaAllocator.init(gpa);
@@ -501,13 +501,12 @@ pub fn main() !void {
                 while (iter.nextAlloc(arena, .{ .diags = &diags }) catch |err| {
                     die("failed to iterate songs table: {s}: {}", .{ @errorName(err), diags });
                 }) |song| {
-                    // syntax is like: "fooo {album} barrr {{aaaaaa}}"
                     var parse_state: enum { normal, maybe_fmt, maybe_closing_fmt, fmt } = .normal;
                     var fmt_start: usize = undefined;
                     for (fmt, 0..) |char, i| {
                         switch (char) {
                             '{' => switch (parse_state) {
-                                .maybe_closing_fmt => die("invalid fmt string: estraneous '}}'", .{}),
+                                .maybe_closing_fmt => die("invalid fmt string: extraneous '}}'", .{}),
                                 .maybe_fmt => {
                                     stdout.writeByte('{') catch {};
                                     parse_state = .normal;
@@ -521,13 +520,13 @@ pub fn main() !void {
                                     parse_state = .normal;
                                     stdout.writeByte('}') catch {};
                                 },
-                                .maybe_fmt => die("invalid fmt string: empty format arg", .{}),
+                                .maybe_fmt => die("invalid fmt string: empty format argument", .{}),
                                 .fmt => {
                                     parse_state = .normal;
                                     const format_arg = fmt[fmt_start..i];
                                     const E = std.meta.FieldEnum(T);
                                     const field = std.meta.stringToEnum(E, format_arg) orelse {
-                                        die("invalid fmt arg: '{s}', expected either 'album', 'id', 'artist', 'year', or 'title'", .{format_arg});
+                                        die("invalid fmt argument: '{s}', expected either 'album', 'id', 'artist', 'year', or 'title'", .{format_arg});
                                     };
                                     switch (field) {
                                         .album => stdout.writeAll(
@@ -544,7 +543,7 @@ pub fn main() !void {
                                     fmt_start = i;
                                     parse_state = .fmt;
                                 },
-                                .maybe_closing_fmt => die("invalid fmt string: estraneous '}}'", .{}),
+                                .maybe_closing_fmt => die("invalid fmt string: extraneous '}}'", .{}),
                                 .normal => stdout.writeByte(char) catch {},
                             },
                         }
@@ -602,7 +601,7 @@ pub fn main() !void {
     }
 }
 
-/// returns true if the song thats playing has changed and the player should reload it
+/// returns true if the song that's playing has changed and the player should reload it
 fn interpretNvimQueueFile(allocator: Allocator, queue: *std.ArrayList(u64), curr_queue_idx: *u32) error{
     CantOpenFile,
     CantReadFile,
@@ -873,7 +872,7 @@ fn printSongTable(allocator: Allocator, mut_stmt: anytype) !void {
     };
 
     for (songs) |song| {
-        // write seperator between each row
+        // write separator between each row
         writer.writeAll("├") catch {};
         inline for (fields, 0..) |field, i| {
             const column_len = @field(maxes, field);
@@ -1234,7 +1233,7 @@ fn printHelp(action: ?Action) noreturn {
         ) catch {},
         .@"remove-lyrics" => stderr.writeAll(
             \\Usage:
-            \\  remove-lyrics <ID>      remove the lyrics for the song corresponding to that ID from the database
+            \\  remove-lyrics <ID>      remove the lyrics for the song corresponding to that ID from the database.
             \\
         ) catch {},
     }
