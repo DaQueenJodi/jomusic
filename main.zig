@@ -1403,6 +1403,10 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             return;
         };
 
+        if (fetched.len == 0) {
+            state.result = .song_not_found;
+            return;
+        }
         const song = fetched[0];
         
         var fell_back = false;
