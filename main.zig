@@ -639,9 +639,9 @@ pub fn main() !void {
                 // note might cause issues with unicode but I doubt it matters in practice
                 if (std.ascii.indexOfIgnoreCase(target_str, search_str) == null) continue;
                 if (song.album) |album| {
-                    stdout.print("id: {d} '{s}' by '{s}' from '{s}'\n", .{song.id, song.title, song.artist, album}) catch {};
+                    stdout.print("{d} '{s}' by '{s}' from '{s}'\n", .{song.id, song.title, song.artist, album}) catch {};
                 } else {
-                    stdout.print("id: {d} '{s}' by '{s}'\n", .{song.id, song.title, song.artist}) catch {};
+                    stdout.print("{d} '{s}' by '{s}'\n", .{song.id, song.title, song.artist}) catch {};
                 }
             }
         },
