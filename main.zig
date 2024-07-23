@@ -594,6 +594,57 @@ pub fn main() !void {
             const affected = db.rowsAffected();
             if (affected == 0) std.log.info("no lyrics for song with id '{d}'", .{id});
         },
+        .search => {
+            var arena_impl = std.heap.ArenaAllocator.init(gpa);
+            defer arena_impl.deinit();
+            const arena = arena_impl.allocator();
+
+            const Col = enum {
+                album, artist, title
+            };
+
+            const column_str = args_iter.next() orelse {
+                std.log.err("expected a column to search by", .{});
+                printHelp(.search);
+            };
+
+            const column = std.meta.stringToEnum(Col, column_str) orelse {
+                std.log.err("expected a column name, got: '{s}'", .{column_str});
+                printHelp(.search);
+            };
+
+            const search_str = args_iter.next() orelse {
+                std.log.err("expected a search string", .{});
+                printHelp(.search);
+            };
+
+            var db = openDB();
+            defer db.deinit();
+
+            const query = "SELECT id, title, artist, album FROM songs";
+            var stmt = try db.prepare(query);
+            defer stmt.deinit();
+            const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8 };
+            const songs = stmt.all(T, arena, .{}, .{}) catch |err| {
+                die("DB error: {s}", .{@errorName(err)});
+            };
+
+            const stdout = std.io.getStdOut().writer();
+            for (songs) |song| {
+                const target_str = switch (column) {
+                    .album => song.album orelse "null",
+                    inline else => |t| @field(song, @tagName(t)),
+                };
+
+                // note might cause issues with unicode but I doubt it matters in practice
+                if (std.ascii.indexOfIgnoreCase(target_str, search_str) == null) continue;
+                if (song.album) |album| {
+                    stdout.print("id: {d} '{s}' by '{s}' from '{s}'\n", .{song.id, song.title, song.artist, album}) catch {};
+                } else {
+                    stdout.print("id: {d} '{s}' by '{s}'\n", .{song.id, song.title, song.artist}) catch {};
+                }
+            }
+        },
     }
 }
 
@@ -1223,6 +1274,12 @@ fn printHelp(action: ?Action) noreturn {
             \\  remove-lyrics <ID>      remove the lyrics for the song corresponding to that ID from the database.
             \\
         ) catch {},
+        .search => stderr.writeAll(
+            \\Usage:
+            \\  search <COL> <SEARCH_STRING>    search for SEARCH_STRING in all columns
+            \\COL: one of "album", "artist", or "title"
+            \\
+        ) catch {},
     }
 
     std.process.exit(1);
@@ -1470,6 +1527,7 @@ const Action = enum {
     list,
     remove,
     @"remove-lyrics",
+    search,
 };
 
 const FileType = enum {
