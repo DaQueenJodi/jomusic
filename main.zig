@@ -454,9 +454,8 @@ pub fn main() !void {
             var db = openDB();
             defer db.deinit();
 
-            var diags: sql.Diagnostics = .{};
             const query = "INSERT INTO songs (title, file_contents, album, artist, year) VALUES (?,?,?,?,?)";
-            db.exec(query, .{ .diags = &diags }, .{
+            db.exec(query, .{}, .{
                 si.title,
                 buf,
                 si.album,
@@ -465,7 +464,7 @@ pub fn main() !void {
             }) catch |err| {
                 switch (err) {
                     error.SQLiteConstraintUnique => std.log.err("this file is already in the database, not adding!", .{}),
-                    else => |e| die("failed to execute query '{s}': {s}: {}", .{ query, @errorName(e), diags }),
+                    else => |e| die("DB error: {s}", .{@errorName(e)}),
                 }
             };
         },
@@ -477,7 +476,7 @@ pub fn main() !void {
             defer db.deinit();
             const songs_query = "SELECT id, title, artist, album, year FROM songs";
             var stmt = db.prepare(songs_query) catch |err| {
-                die("failed to get list of songs from the database: {s}", .{@errorName(err)});
+                die("DB error: {s}", .{@errorName(err)});
             };
             defer stmt.deinit();
 
@@ -492,14 +491,13 @@ pub fn main() !void {
                 };
 
                 const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8, year: c_uint };
-                var diags: sql.Diagnostics = .{};
                 var iter = stmt.iterator(T, .{}) catch |err| {
-                    die("failed to create song iterator: {s}", .{@errorName(err)});
+                    die("DB error: {s}", .{@errorName(err)});
                 };
                 const stdout = std.io.getStdOut().writer();
 
-                while (iter.nextAlloc(arena, .{ .diags = &diags }) catch |err| {
-                    die("failed to iterate songs table: {s}: {}", .{ @errorName(err), diags });
+                while (iter.nextAlloc(arena, .{}) catch |err| {
+                    die("DB error: {s}", .{@errorName(err)});
                 }) |song| {
                     var parse_state: enum { normal, maybe_fmt, maybe_closing_fmt, fmt } = .normal;
                     var fmt_start: usize = undefined;
@@ -570,9 +568,8 @@ pub fn main() !void {
             defer db.deinit();
             const query = "DELETE FROM songs AS s WHERE id=?";
 
-            var diags: sql.Diagnostics = .{};
-            db.exec(query, .{ .diags = &diags }, .{id}) catch |err| {
-                die("failed to delete song with id: {d}: {s}: {}", .{ id, @errorName(err), diags });
+            db.exec(query, .{}, .{id}) catch |err| {
+                die("DB error: {s}", .{@errorName(err)});
             };
             const affected = db.rowsAffected();
             if (affected == 0) std.log.err("no song with id '{d}'", .{id});
@@ -591,9 +588,8 @@ pub fn main() !void {
             defer db.deinit();
             const query = "DELETE FROM lyrics WHERE song_id=?";
 
-            var diags: sql.Diagnostics = .{};
-            db.exec(query, .{ .diags = &diags }, .{id}) catch |err| {
-                die("failed to delete lyrics for song with id: {d}: {s}: {}", .{ id, @errorName(err), diags });
+            db.exec(query, .{}, .{id}) catch |err| {
+                die("DB error: {s}", .{@errorName(err)});
             };
             const affected = db.rowsAffected();
             if (affected == 0) std.log.info("no lyrics for song with id '{d}'", .{id});
@@ -673,9 +669,10 @@ fn setupNvimQueue(arena: Allocator, db: *sql.Db, queue: []u64, curr_queue_idx: u
     {
         const all_songs_query = "SELECT id, title, artist, album FROM songs";
         var stmt = try db.prepare(all_songs_query);
+        defer stmt.deinit();
         const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8 };
         var iter = stmt.iterator(T, .{}) catch |err| {
-            die("failed to create song iterator: {s}", .{@errorName(err)});
+            die("DB error: {s}", .{@errorName(err)});
         };
 
         const others_file = try std.fs.createFileAbsolute("/tmp/jomusic_others", .{.truncate = true});
@@ -715,7 +712,7 @@ fn writeSongLineIntoQueueFile(comptime current: bool, arena: Allocator, db: *sql
         .{ .diags = &diags },
         .{id},
     ) catch |err| {
-        die("failed to get song information from the database: {s}: {}", .{ @errorName(err), diags });
+        die("DB error: {s}", .{@errorName(err)});
     };
     const curr_si = maybe_curr_si orelse {
         std.log.err("invalid id '{d}' in queue!", .{id});
@@ -757,9 +754,7 @@ fn haveUserFillInMissingFields(arena: Allocator, found_metadata: MusicFileMetada
 
                 if (field.type == ?[]const u8) {
                     inner: while (true) {
-                        stdout.writeAll("does this song have an album? y/No: ") catch |err| {
-                            die("user input needed but writing to stdout failed: {s}", .{@errorName(err)});
-                        };
+                        stdout.writeAll("does this song have an album? y/No: ") catch {};
                         reader.streamUntilDelimiter(user_input_writer, '\n', null) catch |err| {
                             die("failed to read user input: {s}", .{@errorName(err)});
                         };
@@ -775,9 +770,7 @@ fn haveUserFillInMissingFields(arena: Allocator, found_metadata: MusicFileMetada
                     }
                 }
 
-                stdout.writeAll("please enter the " ++ field.name ++ " for this song: ") catch |err| {
-                    die("user input needed but writing to stdout failed: {s}", .{@errorName(err)});
-                };
+                stdout.writeAll("please enter the " ++ field.name ++ " for this song: ") catch {};
                 reader.streamUntilDelimiter(user_input_writer, '\n', null) catch |err| {
                     die("failed to read user input: {s}", .{@errorName(err)});
                 };
@@ -788,15 +781,11 @@ fn haveUserFillInMissingFields(arena: Allocator, found_metadata: MusicFileMetada
                     []const u8 => @field(si, field.name) = value,
                     c_uint => @field(si, field.name) = std.fmt.parseInt(c_uint, value, 10) catch |err| switch (err) {
                         error.Overflow => {
-                            stdout.writeAll("year is too large!\n") catch |w_err| {
-                                die("user input needed but writing to stdout failed: {s}", .{@errorName(w_err)});
-                            };
+                            stdout.writeAll("year is too large!\n") catch {};
                             continue :outer;
                         },
                         error.InvalidCharacter => {
-                            stdout.writeAll("please enter a number for the year!\n") catch |w_err| {
-                                die("user input needed but writing to stdout failed: {s}", .{@errorName(w_err)});
-                            };
+                            stdout.writeAll("please enter a number for the year!\n") catch {};
                             continue :outer;
                         },
                     },
@@ -814,10 +803,9 @@ fn printSongTable(allocator: Allocator, mut_stmt: anytype) !void {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var diags: sql.Diagnostics = .{};
     const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8, year: c_uint };
-    const songs = mut_stmt.all(T, arena, .{ .diags = &diags }, .{}) catch |err| {
-        die("failed to iterate songs: {s}: {}", .{ @errorName(err), diags });
+    const songs = mut_stmt.all(T, arena, .{}, .{}) catch |err| {
+        die("DB error: {s}", .{@errorName(err)});
     };
 
     const max_id_len = try calcColumnWidth(arena, songs, "id");
@@ -1029,18 +1017,18 @@ fn calcColumnWidth(arena: Allocator, songs: anytype, comptime field: []const u8)
 }
 
 fn openDB() sql.Db {
-    var diags: sql.Diagnostics = .{};
     var db = sql.Db.init(.{
         .mode = .{ .File = "jomusic.db" },
         .open_flags = .{ .write = true, .create = true },
-        .diags = &diags,
     }) catch |err| {
-        die("failed to open jomusic database: {s}: {}", .{ @errorName(err), diags });
+        die("DB error: {s}", .{@errorName(err)});
     };
     errdefer db.deinit();
 
-    if (sql.c.sqlite3_extended_result_codes(db.db, 1) != sql.c.SQLITE_OK) {
-        die("failed to enable extended result codes", .{});
+    const err = sql.c.sqlite3_extended_result_codes(db.db, 1);
+    if (err != sql.c.SQLITE_OK) {
+        const real_err = sql.errorFromResultCode(err);
+        die("DB error: {s}", .{@errorName(real_err)});
     }
     setupDBIfNeeded(&db);
 
@@ -1048,20 +1036,19 @@ fn openDB() sql.Db {
 }
 
 fn setupDBIfNeeded(db: *sql.Db) void {
-    var diags: sql.Diagnostics = .{};
     db.exec(
         "CREATE TABLE IF NOT EXISTS songs (id INTEGER PRIMARY KEY, file_contents BLOB UNIQUE NOT NULL, title TEXT NOT NULL, album TEXT, artist TEXT NOT NULL, year INTEGER NOT NULL)",
-        .{ .diags = &diags },
+        .{},
         .{},
     ) catch |err| {
-        die("failed to set up database: {s}: {}", .{ @errorName(err), diags });
+        die("DB error: {s}", .{@errorName(err)});
     };
     db.exec(
         "CREATE TABLE IF NOT EXISTS lyrics (id INTEGER PRIMARY KEY, lrc_id INTEGER NOT NULL, song_id INTEGER UNIQUE NOT NULL)",
-        .{ .diags = &diags },
+        .{},
         .{},
     ) catch |err| {
-        die("failed to set up database: {s}: {}", .{ @errorName(err), diags });
+        die("DB error: {s}", .{@errorName(err)});
     };
 }
 
@@ -1070,9 +1057,8 @@ const Song = struct {
     pub fn getSongInfo(s: Song, allocator: Allocator, db: sql.Db) SongInfo {
         const query = "SELECT title, album, artist, year FROM songs AS s WHERE s.id = ?";
 
-        var diags: sql.Diagnostics = .{};
-        const maybe_song_info = db.oneAlloc(SongInfo, allocator, query, .{s.id}, .{ .diags = &diags }) catch |err| {
-            die("failed to get song info for song with ID '{d}': {s}: {}", .{ s.id, @errorName(err), diags });
+        const maybe_song_info = db.oneAlloc(SongInfo, allocator, query, .{s.id}, .{}) catch |err| {
+            die("DB error: {s}", .{@errorName(err)});
         };
 
         return maybe_song_info orelse {
@@ -1137,9 +1123,8 @@ const PlayableSong = struct {
 const SongRow = struct { file_contents: []const u8, title: []const u8, album: ?[]const u8, artist: []const u8, year: c_uint };
 fn getSongRowFromDb(db: *sql.Db, allocator: Allocator, id: u64) ?SongRow {
     const query = "SELECT file_contents, title, album, artist, year FROM songs WHERE id=?";
-    var diags: sql.Diagnostics = .{};
-    return db.oneAlloc(SongRow, allocator, query, .{ .diags = &diags }, .{id}) catch |err| {
-        die("failed to retrieve song row from database: {s}: {}", .{ @errorName(err), diags });
+    return db.oneAlloc(SongRow, allocator, query, .{}, .{id}) catch |err| {
+        die("DB error: {s}", .{@errorName(err)});
     };
 }
 
