@@ -1,11 +1,12 @@
 var global_tui_thingmabob_just_for_the_panic_handler_to_be_able_to_unset_it_if_it_has_to_lol: ?std.posix.termios = null;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var gpa_impl = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa_impl.deinit();
+    const gpa = gpa_impl.allocator();
 
-    var args_iter = try std.process.argsWithAllocator(allocator);
+    // we don't support windows anyway /shrug
+    var args_iter = std.process.args();
     defer args_iter.deinit();
 
     _ = args_iter.next() orelse @panic("not a sane environment");
@@ -25,7 +26,7 @@ pub fn main() !void {
     switch (action) {
         .play => blk: {
             // accumulate queue
-            var queue = std.ArrayList(u64).init(allocator);
+            var queue = std.ArrayList(u64).init(gpa);
             defer queue.deinit();
 
             var db = openDB();
@@ -78,7 +79,7 @@ pub fn main() !void {
                     .wants_to_reload => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
-                            allocator.free(synced_lyrics.iter.buffer);
+                            gpa.free(synced_lyrics.iter.buffer);
                         }
                         stdout.writeAll("\x1B[2K\x1B[1G(switched songs)\n") catch {};
                         state = .normal;
@@ -86,7 +87,7 @@ pub fn main() !void {
                     .exit => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
-                            allocator.free(synced_lyrics.iter.buffer);
+                            gpa.free(synced_lyrics.iter.buffer);
                         }
                         stdout.writeAll("\x1B[2K\x1B[1G(exitted)\n") catch {};
                         break;
@@ -94,7 +95,7 @@ pub fn main() !void {
                     .next_song => {
                         if (displaying_synced_lyrics) {
                             displaying_synced_lyrics = false;
-                            allocator.free(synced_lyrics.iter.buffer);
+                            gpa.free(synced_lyrics.iter.buffer);
                         }
                         curr_song_idx += 1;
                         state = .normal;
@@ -112,7 +113,7 @@ pub fn main() !void {
                     },
                     .normal => {
                         const song_id = queue.items[curr_song_idx];
-                        const song = PlayableSong.initFromDB(&db, allocator, song_id) catch |err| switch (err) {
+                        const song = PlayableSong.initFromDB(&db, gpa, song_id) catch |err| switch (err) {
                             error.SongNotFound => {
                                 // TODO: make this not bad lol
                                 if (in_background == .no and !fetching_lyrics) {
@@ -122,7 +123,7 @@ pub fn main() !void {
                             },
                             error.OutOfMemory => |e| return e,
                         };
-                        defer song.deinit(allocator);
+                        defer song.deinit(gpa);
 
                         if (in_background == .no and !fetching_lyrics) {
                             if (song.info.album) |album| {
@@ -279,7 +280,7 @@ pub fn main() !void {
                                     if (milis >= target_ms) {
                                         synced_lyrics.getNextLine() catch |err| switch (err) {
                                             error.ParseError => {
-                                                allocator.free(synced_lyrics.iter.buffer);
+                                                gpa.free(synced_lyrics.iter.buffer);
                                                 warning_to_display.appendSlice("failed to parse line of lyrics file!") catch unreachable;
                                             },
                                         };
@@ -310,7 +311,7 @@ pub fn main() !void {
                                 if (ret > 0) {
                                     switch (in_background) {
                                         .queue => {
-                                            const changed_songs = interpretNvimQueueFile(allocator, &queue, &curr_song_idx) catch |err| changed: {
+                                            const changed_songs = interpretNvimQueueFile(gpa, &queue, &curr_song_idx) catch |err| changed: {
                                                 const fmt = "failed to parse queue file: {s}";
                                                 assertFitsInWarnings(fmt, @TypeOf(err));
                                                 warning_to_display.writer().print(fmt, .{@errorName(err)}) catch unreachable;
@@ -378,9 +379,9 @@ pub fn main() !void {
                                             if (res == .fell_back_to_plain_lyrics) displaying_synced_lyrics = false;
 
                                             if (displaying_synced_lyrics) {
-                                                const duped = try allocator.dupe(u8, buf);
+                                                const duped = try gpa.dupe(u8, buf);
                                                 synced_lyrics = SyncedLyrics.init(duped) catch {
-                                                    allocator.free(duped);
+                                                    gpa.free(duped);
                                                     displaying_synced_lyrics = false;
 
                                                     warning_to_display.appendSlice("failed to parse lyrics file :/") catch unreachable;
@@ -406,7 +407,7 @@ pub fn main() !void {
             // we want to manage strings ourselves so we dont need to dupe anything
             tl.taglib_set_string_management_enabled(0);
 
-            var arena_impl = std.heap.ArenaAllocator.init(allocator);
+            var arena_impl = std.heap.ArenaAllocator.init(gpa);
             defer arena_impl.deinit();
             const arena = arena_impl.allocator();
             const path = args_iter.next() orelse {
@@ -469,7 +470,7 @@ pub fn main() !void {
             };
         },
         .list => {
-            var arena_impl = std.heap.ArenaAllocator.init(allocator);
+            var arena_impl = std.heap.ArenaAllocator.init(gpa);
             defer arena_impl.deinit();
             const arena = arena_impl.allocator();
             var db = openDB();
