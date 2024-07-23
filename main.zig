@@ -24,7 +24,6 @@ pub fn main() !void {
 
     switch (action) {
         .play => blk: {
-
             // accumulate queue
             var queue = std.ArrayList(u64).init(allocator);
             defer queue.deinit();
@@ -68,7 +67,10 @@ pub fn main() !void {
             const fetching_arena = fetching_arena_impl.allocator();
             // only valid while `fetching_lyrics` is true
             var fetching_state: FetchingState = undefined;
-            //  actually play the queue
+
+            // when len is 0, there is no warning
+            var warning_to_display: std.BoundedArray(u8, WARNING_BUFFER_LEN) = .{};
+
             outer: while (true) {
                 switch (state) {
                     .paused,
@@ -141,7 +143,17 @@ pub fn main() !void {
 
                         var i: usize = 0;
                         inner: while (true) {
-                            const input = if (in_background != .no or fetching_lyrics) 0 else readByteOrZero(stdin);
+                            const input = inp: {
+                                if (in_background != .no or fetching_lyrics) {
+                                    break :inp 0;
+                                }
+                                const input = readByteOrZero(stdin);
+                                if (warning_to_display.len > 0 and input != 0) {
+                                    warning_to_display.len = 0;
+                                    break :inp 0;
+                                }
+                                break :inp input;
+                            };
                             switch (input) {
                                 // just a stub for ergonomics
                                 '\x00' => {},
@@ -157,7 +169,7 @@ pub fn main() !void {
                                     if (@divFloor(i, sample_rate) > 2) {
                                         i = 0;
                                         if (c.drmp3_seek_to_pcm_frame(song.mp3, 0) == c.DRMP3_FALSE) {
-                                            die("failed to seek to the start of the song :/", .{});
+                                            warning_to_display.appendSlice("failed to seek to the start of the song :/") catch unreachable;
                                         }
                                     } else {
                                         state = .prev_song;
@@ -175,7 +187,7 @@ pub fn main() !void {
                                     // seek back 5 seconds
                                     i -|= (5 * sample_rate);
                                     if (c.drmp3_seek_to_pcm_frame(song.mp3, i) == c.DRMP3_FALSE) {
-                                        die("failed to seek to :/", .{});
+                                        warning_to_display.appendSlice("failed to seek backwards :/") catch unreachable;
                                     }
                                 },
                                 // right
@@ -183,7 +195,7 @@ pub fn main() !void {
                                     i += (5 * sample_rate);
                                     i = @min(i, total_pcm_count);
                                     if (c.drmp3_seek_to_pcm_frame(song.mp3, i) == c.DRMP3_FALSE) {
-                                        die("failed to seek to :/", .{});
+                                        warning_to_display.appendSlice("failed to seek forwards :/") catch unreachable;
                                     }
                                 },
                                 // queue
@@ -192,74 +204,16 @@ pub fn main() !void {
                                     defer arena_impl.deinit();
                                     const arena = arena_impl.allocator();
 
-                                    const queue_file = std.fs.createFileAbsolute("/tmp/jomusic_queue", .{}) catch |err| {
-                                        die("failed to open jomusic queue file: {s}", .{@errorName(err)});
-                                    };
-                                    defer queue_file.close();
-
-                                    const queue_writer = queue_file.writer();
-
-                                    for (queue.items[0..curr_song_idx]) |curr_id| {
-                                        writeSongLineIntoQueueFile(false, arena, &db, curr_id, queue_writer) catch |err| {
-                                            die("failed to set up queue file: {s}", .{@errorName(err)});
-                                        };
-                                    }
-                                    writeSongLineIntoQueueFile(true, arena, &db, song_id, queue_writer) catch |err| {
-                                        die("failed to set up queue file: {s}", .{@errorName(err)});
-                                    };
-                                    for (queue.items[curr_song_idx + 1 ..]) |curr_id| {
-                                        writeSongLineIntoQueueFile(false, arena, &db, curr_id, queue_writer) catch |err| {
-                                            die("failed to set up queue file: {s}", .{@errorName(err)});
-                                        };
-                                    }
-
-                                    const others_file = std.fs.createFileAbsolute("/tmp/jomusic_others", .{}) catch |err| {
-                                        die("failed to open jomusic others file: {s}", .{@errorName(err)});
-                                    };
-                                    defer others_file.close();
-
-                                    const others_writer = others_file.writer();
-
-                                    const all_songs_query = "SELECT id, title, artist, album FROM songs";
-                                    var stmt = db.prepare(all_songs_query) catch |err| {
-                                        die("failed to get list of songs from the database: {s}", .{@errorName(err)});
-                                    };
-                                    const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8 };
-                                    var diags: sql.Diagnostics = .{};
-                                    var iter = stmt.iterator(T, .{}) catch |err| {
-                                        die("failed to create song iterator: {s}", .{@errorName(err)});
-                                    };
-
-                                    while (iter.nextAlloc(arena, .{ .diags = &diags }) catch |err| {
-                                        die("failed to iterate songs table: {s}: {}", .{ @errorName(err), diags });
-                                    }) |curr_song| {
-                                        others_writer.print("{d} #'{s}' by '{s}'", .{ curr_song.id, curr_song.title, curr_song.artist }) catch |err| {
-                                            die("failed to set up others file: {s}", .{@errorName(err)});
-                                        };
-                                        if (curr_song.album) |album| others_writer.print(" from '{s}'", .{album}) catch |err| {
-                                            die("failed to set up others file: {s}", .{@errorName(err)});
-                                        };
-                                        others_writer.writeByte('\n') catch |err| {
-                                            die("failed to set up others file: {s}", .{@errorName(err)});
-                                        };
-                                    }
-
-                                    const pid = std.posix.fork() catch |err| {
-                                        die("failed to spawn nvim process: fork: {s}", .{@errorName(err)});
-                                    };
-
-                                    if (pid == 0) {
-                                        // we are the child
-                                        const err = std.posix.execvpeZ(
-                                            "nvim",
-                                            &.{ "nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others" },
-                                            @ptrCast(std.os.environ),
-                                        );
-                                        die("failed to spawn nvim process: execvpeZ: {s}", .{@errorName(err)});
-                                    } else {
-                                        // we are the parent
-                                        running_process_id = pid;
+                                    const pid_or_err = setupNvimQueue(arena, &db, queue.items, curr_song_idx);
+                                    if (pid_or_err) |pid| {
                                         in_background = .queue;
+                                        running_process_id = pid;
+                                    } else |err| {
+                                        const prefix = "failed to set up editable queue: ";
+                                        inline for (@typeInfo(@TypeOf(err)).ErrorSet.?) |e| {
+                                            comptime assert(e.name.len + prefix.len <= WARNING_BUFFER_LEN);
+                                        }
+                                        warning_to_display.writer().print("{s}{s}", .{ prefix, @errorName(err) }) catch unreachable;
                                     }
                                 },
                                 // clear screen
@@ -285,14 +239,13 @@ pub fn main() !void {
                                         .result = undefined,
                                     };
 
-                                    var diags: sql.Diagnostics = .{};
                                     const maybe_lrc_id = db.one(
                                         u64,
                                         "SELECT lrc_id FROM lyrics WHERE song_id=?",
-                                        .{ .diags = &diags },
+                                        .{},
                                         .{song_id},
                                     ) catch |err| {
-                                        die("failed to get lyrics from lyrics database: {s}: {}", .{ @errorName(err), diags });
+                                        die("DB error: {s}", .{@errorName(err)});
                                     };
 
                                     const t = std.Thread.spawn(
@@ -300,7 +253,9 @@ pub fn main() !void {
                                         fetchLyricsThreadFn,
                                         .{ &fetching_state, song.info, maybe_lrc_id, l_flavor == 'L' },
                                     ) catch |err| {
-                                        die("failed to fetch lyrics: {s}", .{@errorName(err)});
+                                        const fmt = "failed to spawn lyric fetching thread: {s}";
+                                        assertFitsInWarnings(fmt, @TypeOf(err));
+                                        die(fmt, .{@errorName(err)});
                                     };
                                     t.detach();
                                     stdout.writeAll("\x1B[2K\x1B[1Gfetching lyrics..") catch {};
@@ -322,13 +277,21 @@ pub fn main() !void {
                                     const milis = @divFloor(i * 1000, sample_rate);
                                     const target_ms = synced_lyrics.next_time_ms;
                                     if (milis >= target_ms) {
-                                        synced_lyrics.getNextLine();
+                                        synced_lyrics.getNextLine() catch |err| switch (err) {
+                                            error.ParseError => {
+                                                allocator.free(synced_lyrics.iter.buffer);
+                                                warning_to_display.appendSlice("failed to parse line of lyrics file!") catch unreachable;
+                                            },
+                                        };
                                     }
                                 } else {
                                     stdout.print("{}/{}", .{
                                         fmtSecs(@divFloor(i, sample_rate)),
                                         fmtSecs(length_in_secs),
                                     }) catch {};
+                                    if (warning_to_display.len > 0) {
+                                        stdout.print(" \x1B[31m{s}\x1B[m (press any key to dimiss..)", .{warning_to_display.slice()}) catch {};
+                                    }
                                 }
                             }
                             if (state != .paused) {
@@ -347,64 +310,19 @@ pub fn main() !void {
                                 if (ret > 0) {
                                     switch (in_background) {
                                         .queue => {
-                                            const queue_file = std.fs.openFileAbsolute("/tmp/jomusic_queue", .{}) catch |err| {
-                                                die("failed to open queue file: {s}", .{@errorName(err)});
+                                            const changed_songs = interpretNvimQueueFile(allocator, &queue, &curr_song_idx) catch |err| changed: {
+                                                const fmt = "failed to parse queue file: {s}";
+                                                assertFitsInWarnings(fmt, @TypeOf(err));
+                                                warning_to_display.writer().print(fmt, .{@errorName(err)}) catch unreachable;
+                                                break :changed false;
                                             };
-                                            const len = queue_file.getEndPos() catch |err| {
-                                                die("failed to read jomusic_queue: {s}", .{@errorName(err)});
-                                            };
-                                            const buf = try allocator.alloc(u8, len);
-                                            defer allocator.free(buf);
-                                            _ = queue_file.readAll(buf) catch |err| {
-                                                die("failed to read jomusic_queue: {s}", .{@errorName(err)});
-                                            };
+                                            try std.fs.deleteFileAbsolute("/tmp/jomusic_queue");
+                                            try std.fs.deleteFileAbsolute("/tmp/jomusic_others");
 
-                                            std.fs.deleteFileAbsolute("/tmp/jomusic_queue") catch |err| {
-                                                std.log.err("failed to delete jomusic queue file: {s}", .{@errorName(err)});
-                                            };
-                                            std.fs.deleteFileAbsolute("/tmp/jomusic_others") catch |err| {
-                                                std.log.err("failed to delete jomusic others file: {s}", .{@errorName(err)});
-                                            };
-
-                                            queue.clearRetainingCapacity();
-                                            var line_iter = std.mem.splitScalar(u8, buf, '\n');
-
-                                            var song_id_changed = false;
-                                            var saw_c = false;
-                                            while (line_iter.next()) |line| {
-                                                const significant_line = ln: {
-                                                    const idx = std.mem.indexOfScalar(u8, line, '#') orelse line.len;
-                                                    break :ln line[0..idx];
-                                                };
-                                                var space_iter = std.mem.tokenizeScalar(u8, significant_line, ' ');
-                                                const id_str = space_iter.next() orelse continue;
-                                                const id = std.fmt.parseInt(u64, id_str, 10) catch {
-                                                    die("expected ID to be a u64: got '{s}'", .{id_str});
-                                                };
-                                                try queue.append(id);
-                                                const maybe_current_marker = space_iter.next() orelse continue;
-                                                if (std.mem.eql(u8, maybe_current_marker, "c")) {
-                                                    if (saw_c) {
-                                                        die("expected exactly one line with the 'c' attribute!", .{});
-                                                    }
-                                                    saw_c = true;
-                                                    curr_song_idx = @intCast(queue.items.len - 1);
-
-                                                    // if we switched the current song:
-                                                    if (song_id != id) {
-                                                        song_id_changed = true;
-                                                    }
-                                                } else {
-                                                    die("invalid attribute: {s}", .{maybe_current_marker});
-                                                }
-                                            }
-                                            if (!saw_c) {
-                                                die("expected a line to have a 'c' attribute!", .{});
-                                            }
-                                            if (song_id_changed) {
+                                            if (changed_songs) {
+                                                state = .wants_to_reload;
                                                 in_background = .no;
                                                 running_process_id = undefined;
-                                                state = .wants_to_reload;
                                                 continue :outer;
                                             }
                                         },
@@ -420,49 +338,60 @@ pub fn main() !void {
                             if (fetching_lyrics) {
                                 const done = @atomicLoad(bool, &fetching_state.done, .monotonic);
                                 if (done) {
+                                    defer {
+                                        fetching_state = undefined;
+                                        fetching_lyrics = false;
+                                        _ = fetching_arena_impl.reset(.free_all);
+                                    }
                                     switch (fetching_state.result) {
                                         .out_of_memory => return error.OutOfMemory,
-                                        .fell_back_to_plain_lyrics => {
-                                            assert(displaying_synced_lyrics);
-                                            // todo handle this more gracefully with user input maybe
-                                            displaying_synced_lyrics = false;
-                                        },
                                         inline .couldnt_parse_json,
+                                        .fell_back_to_plain_lyrics,
                                         .couldnt_fetch,
                                         .unexpected_status_code,
                                         .song_not_found,
                                         .success,
                                         => |res| {
-                                            const success = res == .success;
+                                            const success = res == .success or res == .fell_back_to_plain_lyrics;
                                             if (success) {
                                                 if (fetching_state.fetched_lrc_id) |lrc_id| {
-                                                    var diags: sql.Diagnostics = .{};
                                                     db.exec(
                                                         "INSERT INTO lyrics (song_id, lrc_id) VALUES (?, ?)",
-                                                        .{ .diags = &diags },
+                                                        .{},
                                                         .{ song_id, lrc_id },
                                                     ) catch |err| {
-                                                        die("failed to insert lyrics into table: {s}: {}", .{ @errorName(err), diags });
+                                                        die("DB error: {s}", .{@errorName(err)});
                                                     };
                                                 }
                                             }
 
                                             const buf = switch (success) {
                                                 true => fetching_state.fetched.items,
-                                                false => std.fmt.comptimePrint("failed to fetch lyrics: {s}", .{@tagName(res)}),
+                                                false => {
+                                                    displaying_synced_lyrics = false;
+                                                    const fmt = "failed to fetch lyrics: {s}";
+                                                    assertFitsInWarnings(fmt, @TypeOf(res));
+                                                    warning_to_display.writer().print(fmt, .{@tagName(res)}) catch unreachable;
+                                                    continue :inner;
+                                                },
                                             };
+                                            if (res == .fell_back_to_plain_lyrics) displaying_synced_lyrics = false;
+
                                             if (displaying_synced_lyrics) {
                                                 const duped = try allocator.dupe(u8, buf);
-                                                synced_lyrics = SyncedLyrics.init(duped);
+                                                synced_lyrics = SyncedLyrics.init(duped) catch {
+                                                    allocator.free(duped);
+                                                    displaying_synced_lyrics = false;
+
+                                                    warning_to_display.appendSlice("failed to parse lyrics file :/") catch unreachable;
+                                                    continue :inner;
+                                                };
                                             } else {
                                                 const pid = try spawnPagerWithLyrics(buf);
                                                 running_process_id = pid;
                                                 in_background = .pager;
                                             }
 
-                                            fetching_state = undefined;
-                                            fetching_lyrics = false;
-                                            _ = fetching_arena_impl.reset(.free_all);
                                         },
                                     }
                                 }
@@ -669,6 +598,110 @@ pub fn main() !void {
             const affected = db.rowsAffected();
             if (affected == 0) std.log.info("no lyrics for song with id '{d}'", .{id});
         },
+    }
+}
+
+/// returns true if the song thats playing has changed and the player should reload it
+fn interpretNvimQueueFile(allocator: Allocator, queue: *std.ArrayList(u64), curr_queue_idx: *u32) error{
+    CantOpenFile,
+    CantReadFile,
+    OutOfMemory,
+    MultipleCurrent,
+    NoCurrent,
+    ParseError,
+}!bool {
+    const curr_song_id = queue.items[curr_queue_idx.*];
+
+    const queue_file = std.fs.openFileAbsolute("/tmp/jomusic_queue", .{}) catch return error.CantOpenFile;
+    const len = queue_file.getEndPos() catch return error.CantReadFile;
+    const buf = try allocator.alloc(u8, len);
+    defer allocator.free(buf);
+    _ = queue_file.readAll(buf) catch return error.CantReadFile;
+
+    queue.clearRetainingCapacity();
+    var line_iter = std.mem.splitScalar(u8, buf, '\n');
+
+    var changed_songs: bool = false;
+    var saw_c = false;
+    while (line_iter.next()) |line| {
+        const significant_line = ln: {
+            const idx = std.mem.indexOfScalar(u8, line, '#') orelse line.len;
+            break :ln line[0..idx];
+        };
+        var space_iter = std.mem.tokenizeScalar(u8, significant_line, ' ');
+        const id_str = space_iter.next() orelse continue;
+        const id = std.fmt.parseInt(u64, id_str, 10) catch return error.ParseError;
+        try queue.append(id);
+        const maybe_current_marker = space_iter.next() orelse continue;
+        if (std.mem.eql(u8, maybe_current_marker, "c")) {
+            if (saw_c) {
+                return error.MultipleCurrent;
+            }
+            saw_c = true;
+            curr_queue_idx.* = @intCast(queue.items.len - 1);
+
+            // if we switched the current song:
+            if (curr_song_id != id) {
+                changed_songs = true;
+            }
+        } else {
+            return error.ParseError;
+        }
+    }
+    if (!saw_c) {
+        return error.NoCurrent;
+    }
+    return changed_songs;
+}
+
+fn setupNvimQueue(arena: Allocator, db: *sql.Db, queue: []u64, curr_queue_idx: usize) !std.posix.pid_t {
+    {
+        const queue_file = try std.fs.createFileAbsolute("/tmp/jomusic_queue", .{.truncate = true});
+        defer queue_file.close();
+
+        const queue_writer = queue_file.writer();
+
+        for (queue[0..curr_queue_idx]) |curr_id| {
+            try writeSongLineIntoQueueFile(false, arena, db, curr_id, queue_writer);
+        }
+        try writeSongLineIntoQueueFile(true, arena, db, queue[curr_queue_idx], queue_writer);
+        for (queue[curr_queue_idx + 1 ..]) |curr_id| {
+            try writeSongLineIntoQueueFile(false, arena, db, curr_id, queue_writer);
+        }
+    }
+
+    {
+        const all_songs_query = "SELECT id, title, artist, album FROM songs";
+        var stmt = try db.prepare(all_songs_query);
+        const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8 };
+        var iter = stmt.iterator(T, .{}) catch |err| {
+            die("failed to create song iterator: {s}", .{@errorName(err)});
+        };
+
+        const others_file = try std.fs.createFileAbsolute("/tmp/jomusic_others", .{.truncate = true});
+        defer others_file.close();
+
+        const others_writer = others_file.writer();
+
+        while (try iter.nextAlloc(arena, .{})) |curr_song| {
+            try others_writer.print("{d} #'{s}' by '{s}'", .{ curr_song.id, curr_song.title, curr_song.artist });
+            if (curr_song.album) |album| try others_writer.print(" from '{s}'", .{album});
+            try others_writer.writeByte('\n');
+        }
+    }
+
+    const pid = try std.posix.fork();
+
+    if (pid == 0) {
+        // we are the child
+        return std.posix.execvpeZ(
+            "nvim",
+            &.{ "nvim", "-O2", "/tmp/jomusic_queue", "/tmp/jomusic_others" },
+            @ptrCast(std.os.environ),
+        );
+    } else {
+        // we are the parent
+        return pid;
     }
 }
 
@@ -1253,9 +1286,6 @@ inline fn die(comptime fmt: []const u8, args: anytype) noreturn {
     }
 }
 
-const MAX_SONG_COLUMN_LEN = 35;
-const ELLIPSIS = "...";
-
 // same as std.os.linux but status is allowed to be NULL
 fn waitpid(pid: std.os.linux.pid_t, status: ?*u32, flags: u32) usize {
     return std.os.linux.syscall4(.wait4, @as(usize, @bitCast(@as(isize, pid))), @intFromPtr(status), flags, 0);
@@ -1374,10 +1404,12 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
         };
 
         const song = fetched[0];
+        
+        var fell_back = false;
         const lyrics = blk: {
             if (synced_lyrics) {
                 break :blk song.syncedLyrics orelse {
-                    state.result = .fell_back_to_plain_lyrics;
+                    fell_back = true;
                     break :blk song.plainLyrics;
                 };
             } else break :blk song.plainLyrics;
@@ -1387,9 +1419,16 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             state.result = .out_of_memory;
             return;
         };
-
         state.fetched_lrc_id = song.id;
+
+        if (fell_back) {
+            state.result = .fell_back_to_plain_lyrics;
+            return;
+        }
+
     } else {
+        state.fetched_lrc_id = null;
+
         const JsonT = switch (synced_lyrics) {
             true => struct {
                 syncedLyrics: ?[]const u8,
@@ -1411,10 +1450,11 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             };
             return;
         };
+        var fell_back = false;
         const lyrics = blk: {
             if (synced_lyrics) {
                 break :blk song.syncedLyrics orelse {
-                    state.result = .fell_back_to_plain_lyrics;
+                    fell_back = true;
                     break :blk song.plainLyrics;
                 };
             } else break :blk song.plainLyrics;
@@ -1424,7 +1464,10 @@ fn fetchLyricsThreadFn(state: *FetchingState, si: SongInfo, maybe_lrc_id: ?u64, 
             state.result = .out_of_memory;
             return;
         };
-        state.fetched_lrc_id = null;
+        if (fell_back) {
+            state.result = .fell_back_to_plain_lyrics;
+            return;
+        }
     }
 
     state.result = .success;
@@ -1442,9 +1485,25 @@ const FileType = enum {
     mp3,
 };
 
+fn assertFitsInWarnings(comptime fmt: []const u8, comptime T: type) void {
+    const info = @typeInfo(T);
+    const fields = switch (info) {
+        .ErrorSet => |es| es orelse return,
+        .Enum => |e| e.fields,
+        else => unreachable,
+    };
+    inline for (fields) |field| {
+        comptime assert(std.fmt.count(fmt, .{field.name}) <= WARNING_BUFFER_LEN);
+    }
+}
+
 fn CTRL(char: u8) u8 {
     return char - 'a' + 1;
 }
+
+const WARNING_BUFFER_LEN = 1024;
+const MAX_SONG_COLUMN_LEN = 35;
+const ELLIPSIS = "...";
 
 const std = @import("std");
 const builtin = @import("builtin");

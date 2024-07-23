@@ -6,23 +6,18 @@ const SyncedLyrics = @This();
 
 const NEXT_TIME_SENTINEL = std.math.maxInt(u64);
 
-pub fn init(buf: []const u8) SyncedLyrics {
+pub fn init(buf: []const u8) error{ParseError}!SyncedLyrics {
     var sl: SyncedLyrics = undefined;
     sl.iter = std.mem.splitScalar(u8, buf, '\n');
-    sl.getNextLine();
+    try sl.getNextLine();
     return sl;
 }
-pub fn getNextLine(sl: *SyncedLyrics) void {
+pub fn getNextLine(sl: *SyncedLyrics) error{ParseError}!void {
     sl.curr_line = sl.iter.next().?;
 
     sl.next_time_ms = ms: {
         const next = sl.iter.peek() orelse break :ms NEXT_TIME_SENTINEL;
-        break :ms extractMsTimeFromSynchronizedLyricLine(next) catch |err| switch (err) {
-            error.ParseError => {
-                sl.curr_line = "failed to parse lyrics file :/";
-                break :ms NEXT_TIME_SENTINEL;
-            },
-        };
+        break :ms try extractMsTimeFromSynchronizedLyricLine(next);
     };
 }
 fn extractMsTimeFromSynchronizedLyricLine(line: []const u8) error{ParseError}!u64 {
