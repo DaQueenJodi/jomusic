@@ -410,63 +410,69 @@ pub fn main() !void {
             var arena_impl = std.heap.ArenaAllocator.init(gpa);
             defer arena_impl.deinit();
             const arena = arena_impl.allocator();
-            const path = args_iter.next() orelse {
-                std.log.err("expected file path argument", .{});
-                printHelp(.add);
-            };
 
-            const f = std.fs.cwd().openFile(path, .{}) catch |err| {
-                die("failed to open file '{s}': {s}", .{ path, @errorName(err) });
-            };
-            const f_len = f.getEndPos() catch |err| {
-                die("failed to seek file '{s}': {s}. Is this a regular file?", .{ path, @errorName(err) });
-            };
+            var did_a_thing = false;
+            while (args_iter.next()) |path| {
+                const f = std.fs.cwd().openFile(path, .{}) catch |err| {
+                    die("failed to open file '{s}': {s}", .{ path, @errorName(err) });
+                };
+                const f_len = f.getEndPos() catch |err| {
+                    die("failed to seek file '{s}': {s}. Is this a regular file?", .{ path, @errorName(err) });
+                };
 
-            const buf = try arena.alloc(u8, f_len);
+                const buf = try arena.alloc(u8, f_len);
 
-            const real_len = f.readAll(buf) catch |err| {
-                die("failed to read file '{s}': {s}", .{ path, @errorName(err) });
-            };
-            if (real_len != f_len) die("file length mismatch while reading '{s}'. Is it a regular file?", .{path});
+                const real_len = f.readAll(buf) catch |err| {
+                    die("failed to read file '{s}': {s}", .{ path, @errorName(err) });
+                };
+                if (real_len != f_len) die("file length mismatch while reading '{s}'. Is it a regular file?", .{path});
 
-            const found_metadata = MusicFileMetadata.initFromBuffer(buf) catch |err| switch (err) {
-                error.NotAValidFile => die("file '{s}' does not seem to be a valid music file", .{path}),
-            };
-            defer found_metadata.deinit();
+                const found_metadata = MusicFileMetadata.initFromBuffer(buf) catch |err| switch (err) {
+                    error.NotAValidFile => die("file '{s}' does not seem to be a valid music file", .{path}),
+                };
+                defer found_metadata.deinit();
 
-            var has_something_missing = false;
-            inline for (@typeInfo(MusicFileMetadata).Struct.fields) |field| {
-                if (@field(found_metadata, field.name) == null) has_something_missing = true;
+                var has_something_missing = false;
+                inline for (@typeInfo(MusicFileMetadata).Struct.fields) |field| {
+                    if (@field(found_metadata, field.name) == null) has_something_missing = true;
+                }
+
+                const si = if (has_something_missing) blk: {
+                    break :blk haveUserFillInMissingFields(arena, found_metadata) catch |err| switch (err) {
+                        error.OutOfMemory => |e| return e,
+                    };
+                } else blk: {
+                    var si: SongInfo = undefined;
+                    inline for (@typeInfo(MusicFileMetadata).Struct.fields) |field| {
+                        @field(si, field.name) = @field(found_metadata, field.name).?;
+                    }
+                    break :blk si;
+                };
+
+                var db = openDB();
+                defer db.deinit();
+
+                const query = "INSERT INTO songs (title, file_contents, album, artist, year) VALUES (?,?,?,?,?)";
+                db.exec(query, .{}, .{
+                    si.title,
+                    buf,
+                    si.album,
+                    si.artist,
+                    si.year,
+                }) catch |err| {
+                    switch (err) {
+                        error.SQLiteConstraintUnique => std.log.err("this file is already in the database, not adding!", .{}),
+                        else => |e| die("DB error: {s}", .{@errorName(e)}),
+                    }
+                };
+
+                did_a_thing = true;
             }
 
-            const si = if (has_something_missing) blk: {
-                break :blk haveUserFillInMissingFields(arena, found_metadata) catch |err| switch (err) {
-                    error.OutOfMemory => |e| return e,
-                };
-            } else blk: {
-                var si: SongInfo = undefined;
-                inline for (@typeInfo(MusicFileMetadata).Struct.fields) |field| {
-                    @field(si, field.name) = @field(found_metadata, field.name).?;
-                }
-                break :blk si;
-            };
-
-            var db = openDB();
-            defer db.deinit();
-
-            const query = "INSERT INTO songs (title, file_contents, album, artist, year) VALUES (?,?,?,?,?)";
-            db.exec(query, .{}, .{
-                si.title,
-                buf,
-                si.album,
-                si.artist,
-                si.year,
-            }) catch |err| {
-                switch (err) {
-                    error.SQLiteConstraintUnique => std.log.err("this file is already in the database, not adding!", .{}),
-                    else => |e| die("DB error: {s}", .{@errorName(e)}),
-                }
-            };
+            if (!did_a_thing) {
+                std.log.err("expected path argument", .{});
+                printHelp(.add);
+            }
         },
         .list => {
             var arena_impl = std.heap.ArenaAllocator.init(gpa);
@@ -484,11 +490,17 @@ pub fn main() !void {
                 try printSongTable(arena, &stmt);
                 return;
             };
+
             if (std.mem.eql(u8, arg, "--fmt")) {
                 const fmt = args_iter.next() orelse {
                     std.log.err("expected fmt argument!", .{});
                     printHelp(.list);
                 };
+
+                if (args_iter.next()) |extra_arg| {
+                    std.log.err("extraneous argument: '{s}'", .{extra_arg});
+                    printHelp(.list);
+                }
 
                 const T = struct { id: u64, title: []const u8, artist: []const u8, album: ?[]const u8, year: c_uint };
                 var iter = stmt.iterator(T, .{}) catch |err| {
@@ -545,6 +557,9 @@ pub fn main() !void {
                                 .normal => stdout.writeByte(char) catch {},
                             },
                         }
+                    } else {
+                        std.log.err("invalid argument: {s}", .{arg});
+                        printHelp(.list);
                     }
                     stdout.writeByte('\n') catch {};
                 }
@@ -554,45 +569,54 @@ pub fn main() !void {
             }
         },
         .remove => {
-            const id_str = args_iter.next() orelse {
-                std.log.err("expected ID argument", .{});
-                printHelp(.remove);
-            };
+            var did_a_thing = false;
+            while (args_iter.next()) |id_str| {
 
-            const id = std.fmt.parseInt(u64, id_str, 10) catch {
-                std.log.err("expected ID to be a number, got '{s}'", .{id_str});
-                printHelp(.remove);
-            };
+                const id = std.fmt.parseInt(u64, id_str, 10) catch {
+                    std.log.err("expected ID to be a number, got '{s}'", .{id_str});
+                    printHelp(.remove);
+                };
 
-            var db = openDB();
-            defer db.deinit();
-            const query = "DELETE FROM songs AS s WHERE id=?";
+                var db = openDB();
+                defer db.deinit();
+                const query = "DELETE FROM songs AS s WHERE id=?";
 
-            db.exec(query, .{}, .{id}) catch |err| {
-                die("DB error: {s}", .{@errorName(err)});
-            };
-            const affected = db.rowsAffected();
-            if (affected == 0) std.log.err("no song with id '{d}'", .{id});
+                db.exec(query, .{}, .{id}) catch |err| {
+                    die("DB error: {s}", .{@errorName(err)});
+                };
+                const affected = db.rowsAffected();
+                if (affected == 0) std.log.err("no song with id '{d}'", .{id});
+
+                did_a_thing = true;
+            }
+
+            if (!did_a_thing) {
+                std.log.err("expected ID argument!", .{});
+            }
         },
         .@"remove-lyrics" => {
-            const id_str = args_iter.next() orelse {
+            var did_a_thing = false;
+            while (args_iter.next()) |id_str| {
+                const id = std.fmt.parseInt(u64, id_str, 10) catch {
+                    std.log.err("expected ID to be a number, got '{s}'", .{id_str});
+                    printHelp(.remove);
+                };
+                did_a_thing = true;
+
+                var db = openDB();
+                defer db.deinit();
+                const query = "DELETE FROM lyrics WHERE song_id=?";
+
+                db.exec(query, .{}, .{id}) catch |err| {
+                    die("DB error: {s}", .{@errorName(err)});
+                };
+                const affected = db.rowsAffected();
+                if (affected == 0) std.log.info("no lyrics for song with id '{d}'", .{id});
+            }
+            if (!did_a_thing) {
                 std.log.err("expected ID argument", .{});
                 printHelp(.@"remove-lyrics");
-            };
-            const id = std.fmt.parseInt(u64, id_str, 10) catch {
-                std.log.err("expected ID to be a number, got '{s}'", .{id_str});
-                printHelp(.remove);
-            };
-
-            var db = openDB();
-            defer db.deinit();
-            const query = "DELETE FROM lyrics WHERE song_id=?";
-
-            db.exec(query, .{}, .{id}) catch |err| {
-                die("DB error: {s}", .{@errorName(err)});
-            };
-            const affected = db.rowsAffected();
-            if (affected == 0) std.log.info("no lyrics for song with id '{d}'", .{id});
+            }
         },
         .search => {
             var arena_impl = std.heap.ArenaAllocator.init(gpa);
@@ -617,6 +641,11 @@ pub fn main() !void {
                 std.log.err("expected a search string", .{});
                 printHelp(.search);
             };
+
+            if (args_iter.next()) |extra_arg| {
+                std.log.err("extraneous argument: '{s}'", .{extra_arg});
+                printHelp(.search);
+            }
 
             var db = openDB();
             defer db.deinit();
